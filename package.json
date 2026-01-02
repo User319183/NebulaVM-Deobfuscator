@@ -1,0 +1,31 @@
+{
+  "name": "nebula-deobfuscator",
+  "version": "1.0.0",
+  "description": "CLI tool to deobfuscate JavaScript code obfuscated with Nebula VM",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "nebula-deob": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node src/index.js --help"
+  },
+  "keywords": [
+    "javascript",
+    "deobfuscator",
+    "nebula-vm",
+    "reverse-engineering"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@babel/generator": "^7.28.5",
+    "@babel/parser": "^7.28.5",
+    "@babel/traverse": "^7.28.5",
+    "@babel/types": "^7.28.5",
+    "chalk": "^5.6.2",
+    "commander": "^11.1.0",
+    "ora": "^7.0.1",
+    "pako": "^2.1.0"
+  }
+}
