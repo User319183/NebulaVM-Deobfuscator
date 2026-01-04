@@ -1,10 +1,10 @@
 /**
  * Control Flow Reconstructor
- * 
+ *
  * Recovers structured control flow from flat bytecode sequences.
  * This module analyzes instruction patterns to detect and reconstruct
  * high-level control flow structures (loops, conditionals).
- * 
+ *
  * Key concepts:
  * - Basic block: A straight-line sequence of code with no branches except at the end
  * - Merge point: Where divergent control flow paths reconverge
@@ -18,21 +18,19 @@ export class ControlFlowReconstructor {
   constructor(instructions) {
     this.instructions = instructions;
     this.addrToIdx = new Map();
-    
+
     for (let i = 0; i < instructions.length; i++) {
       this.addrToIdx.set(instructions[i].addr, i);
     }
   }
 
   /**
-   * Analyze control flow to detect loops and conditionals
+   * Analyze control flow to detect loops
    * Returns structured information about control flow patterns
    */
   analyze() {
     const loops = this.detectLoops();
-    const conditionals = this.detectConditionals(loops);
-    
-    return { loops, conditionals, addrToIdx: this.addrToIdx };
+    return { loops };
   }
 
   /**
@@ -44,14 +42,14 @@ export class ControlFlowReconstructor {
    */
   detectLoops() {
     const loops = [];
-    
+
     for (let i = 0; i < this.instructions.length; i++) {
       const instr = this.instructions[i];
-      
+
       if (instr.opName === 'JUMP') {
         const targetAddr = instr.args[0]?.value;
         const targetIdx = this.addrToIdx.get(targetAddr);
-        
+
         if (targetIdx !== undefined && targetIdx > i) {
           for (let j = targetIdx; j < this.instructions.length; j++) {
             const checkInstr = this.instructions[j];
@@ -76,65 +74,8 @@ export class ControlFlowReconstructor {
         }
       }
     }
-    
-    return loops;
-  }
 
-  /**
-   * Detect conditional (if-else) patterns
-   * Excludes jump instructions that are part of loops
-   * 
-   * If-else pattern:
-   * - JUMP_IF_X to else_label
-   * - [if body basic blocks]
-   * - JUMP to end_label (if has else)
-   * - else_label: [else body basic blocks]
-   * - end_label: (merge point)
-   */
-  detectConditionals(loops) {
-    const conditionals = [];
-    
-    for (let i = 0; i < this.instructions.length; i++) {
-      const instr = this.instructions[i];
-      
-      if ((instr.opName === 'JUMP_IF_TRUE' || instr.opName === 'JUMP_IF_FALSE') && 
-          !loops.some(l => l.condJumpIdx === i)) {
-        const targetAddr = instr.args[0]?.value;
-        const targetIdx = this.addrToIdx.get(targetAddr);
-        
-        if (targetIdx !== undefined && targetIdx > i) {
-          let hasElse = false;
-          let elseStartIdx = targetIdx;
-          let endIdx = targetIdx;
-          
-          for (let j = i + 1; j < targetIdx; j++) {
-            const bodyInstr = this.instructions[j];
-            if (bodyInstr.opName === 'JUMP' && j === targetIdx - 1) {
-              const endAddr = bodyInstr.args[0]?.value;
-              const endTargetIdx = this.addrToIdx.get(endAddr);
-              if (endTargetIdx !== undefined && endTargetIdx > targetIdx) {
-                hasElse = true;
-                endIdx = endTargetIdx;
-                break;
-              }
-            }
-          }
-          
-          conditionals.push({
-            condIdx: i,
-            ifBodyStart: i + 1,
-            ifBodyEnd: hasElse ? targetIdx - 1 : targetIdx,
-            elseStart: hasElse ? targetIdx : null,
-            elseEnd: hasElse ? endIdx : null,
-            endIdx: hasElse ? endIdx : targetIdx,
-            hasElse: hasElse,
-            isIfFalse: instr.opName === 'JUMP_IF_FALSE'
-          });
-        }
-      }
-    }
-    
-    return conditionals;
+    return loops;
   }
 
   /**
@@ -156,7 +97,7 @@ export class ControlFlowReconstructor {
    */
   buildRegionMap(cfg) {
     const regionsByCondIdx = new Map();
-    
+
     for (const region of cfg.regions) {
       if (region.type === 'if-else' && region.conditionBlock) {
         const condBlock = region.conditionBlock;
@@ -164,8 +105,80 @@ export class ControlFlowReconstructor {
         regionsByCondIdx.set(condJumpIdx, region);
       }
     }
-    
+
     return regionsByCondIdx;
+  }
+
+  /**
+   * Detect ternary expression pattern (ConditionalExpression)
+   *
+   * Ternary pattern from NebulaVM ConditionalExpressionCompiler:
+   * - [test expression]
+   * - JUMP_IF_FALSE -> else_label
+   * - [consequent expression - pushes 1 value]
+   * - JUMP -> end_label
+   * - else_label: [alternate expression - pushes 1 value]
+   * - end_label:
+   *
+   * Key difference from if-else statement: both branches are pure expressions
+   * that push exactly one value onto the stack.
+   */
+  detectTernaryExpressions(regionsByCondIdx) {
+    const ternaries = new Map();
+
+    for (const [condIdx, region] of regionsByCondIdx) {
+      if (!region.falseBlocks || region.falseBlocks.length === 0) continue;
+
+      const isTernary = this.isTernaryPattern(region);
+      if (isTernary) {
+        ternaries.set(condIdx, {
+          ...region,
+          isTernary: true,
+          trueExprRange: isTernary.trueRange,
+          falseExprRange: isTernary.falseRange
+        });
+      }
+    }
+
+    return ternaries;
+  }
+
+  /**
+   * Check if a conditional region matches the ternary expression pattern
+   * Returns range info if it's a ternary, null otherwise
+   */
+  isTernaryPattern(region) {
+    if (!region.trueBlocks || !region.falseBlocks) return null;
+    if (region.trueBlocks.length !== 1 || region.falseBlocks.length !== 1) return null;
+
+    const trueBlock = region.trueBlocks[0];
+    const falseBlock = region.falseBlocks[0];
+
+    const trueInstrs = trueBlock.instructions.filter(i => i.opName !== 'JUMP');
+    const falseInstrs = falseBlock.instructions.filter(i => i.opName !== 'JUMP');
+
+    const isPureExpr = (instrs) => {
+      if (instrs.length === 0) return false;
+
+      const statementOps = new Set([
+        'STORE_VARIABLE', 'SET_PROPERTY', 'UNARY_THROW', 'RETURN', 'DEBUGGER'
+      ]);
+
+      for (const instr of instrs) {
+        if (statementOps.has(instr.opName)) return false;
+      }
+
+      return true;
+    };
+
+    if (isPureExpr(trueInstrs) && isPureExpr(falseInstrs)) {
+      return {
+        trueRange: { start: trueBlock.startIdx, end: trueBlock.endIdx },
+        falseRange: { start: falseBlock.startIdx, end: falseBlock.endIdx }
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -174,12 +187,12 @@ export class ControlFlowReconstructor {
   buildLoopMaps(loops) {
     const loopsByInitJump = new Map();
     const loopsByCondJump = new Map();
-    
+
     for (const loop of loops) {
       loopsByInitJump.set(loop.initJumpIdx, loop);
       loopsByCondJump.set(loop.condJumpIdx, loop);
     }
-    
+
     return { loopsByInitJump, loopsByCondJump };
   }
 
@@ -189,14 +202,14 @@ export class ControlFlowReconstructor {
    */
   findUsedLabels(loops, regionsByCondIdx) {
     const usedLabels = new Set();
-    
+
     for (const instr of this.instructions) {
       if (['JUMP', 'JUMP_IF_TRUE', 'JUMP_IF_FALSE'].includes(instr.opName)) {
         const targetAddr = instr.args[0]?.value;
         const instrIdx = this.instructions.indexOf(instr);
-        
-        if (targetAddr !== undefined && 
-            !loops.some(l => 
+
+        if (targetAddr !== undefined &&
+            !loops.some(l =>
               this.instructions[l.condJumpIdx]?.args[0]?.value === targetAddr ||
               this.instructions[l.initJumpIdx]?.args[0]?.value === targetAddr
             ) &&
@@ -205,7 +218,7 @@ export class ControlFlowReconstructor {
         }
       }
     }
-    
+
     return usedLabels;
   }
 }

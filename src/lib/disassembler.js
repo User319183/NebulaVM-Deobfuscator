@@ -1,16 +1,16 @@
 /**
  * NebulaVM Bytecode Disassembler
  * ================================
- * 
+ *
  * This module implements a disassembler for the NebulaVM's custom bytecode format.
  * It decodes the raw byte stream into structured instruction objects suitable for
  * analysis and decompilation.
- * 
+ *
  * VM Instruction Format:
  * - Each instruction begins with a 1-byte opcode
  * - Operands follow in little-endian format (variable length per instruction)
  * - Opcode values are shuffled per-obfuscation (opcodeMap provides translation)
- * 
+ *
  * Disassembly Process:
  * 1. Handle optional zlib compression (first byte indicates compression)
  * 2. Read opcode byte and dispatch to appropriate operand decoder
@@ -115,7 +115,7 @@ export class Disassembler {
 
   /**
    * Main disassembly loop: Decode bytecode stream into instruction objects.
-   * 
+   *
    * Algorithm:
    * 1. Check compression flag and decompress if needed
    * 2. Iterate through bytecode until end of stream
@@ -142,7 +142,7 @@ export class Disassembler {
       const addr = this.pointer;
       const opcode = this.readInstruction();
       const opName = this.getOpcodeName(opcode);
-      
+
       const instr = { addr, opcode, opName, args: [] };
 
       try {
@@ -153,25 +153,25 @@ export class Disassembler {
             instr.stringValue = this.strings[idx] || `[string_${idx}]`;
             break;
           }
-          
+
           case 'STACK_PUSH_DWORD': {
             const val = this.readSignedDword();
             instr.args.push({ type: 'dword', value: val });
             break;
           }
-          
+
           case 'STACK_PUSH_DOUBLE': {
             const val = this.readDouble();
             instr.args.push({ type: 'double', value: val });
             break;
           }
-          
+
           case 'STACK_PUSH_BOOLEAN': {
             const val = this.readInstruction() === 1;
             instr.args.push({ type: 'boolean', value: val });
             break;
           }
-          
+
           case 'STACK_PUSH_NULL':
           case 'STACK_PUSH_UNDEFINED':
           case 'STACK_PUSH_DUPLICATE':

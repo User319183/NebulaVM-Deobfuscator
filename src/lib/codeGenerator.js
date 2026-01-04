@@ -1,9 +1,9 @@
 /**
  * Code Generator Facade
- * 
+ *
  * Orchestrates the decompilation process by coordinating the stack machine,
  * statement emitter, and control flow reconstructor modules.
- * 
+ *
  * The decompilation pipeline:
  * 1. Control flow reconstruction - Recovers high-level structures from bytecode
  * 2. Symbolic execution - Simulates the VM stack to track values
@@ -15,18 +15,19 @@ import { StatementEmitter } from '../emission/statementEmitter.js';
 import { ControlFlowReconstructor } from '../emission/controlFlowReconstructor.js';
 
 export class CodeGenerator {
-  constructor(instructions, strings, opcodeMap, returnOpcode = null) {
+  constructor(instructions, strings, opcodeMap, returnOpcode = null, swappedOpcodes = new Set()) {
     this.instructions = instructions;
     this.strings = strings;
     this.opcodeMap = opcodeMap;
     this.returnOpcode = returnOpcode;
+    this.swappedOpcodes = swappedOpcodes;
     this.varCounter = 0;
     this.output = [];
     this.indent = 0;
     this.addressToLabel = new Map();
     this.usedLabels = new Set();
     this.pendingReturn = null;
-    
+
     this.stackMachine = new StackMachine(strings, this.getVarName.bind(this));
     this.emitter = new StatementEmitter(this);
     this.cfReconstructor = new ControlFlowReconstructor(instructions);
@@ -39,12 +40,12 @@ export class CodeGenerator {
     if (varId === undefined || varId === null || varId > 10000) {
       return `var_unknown_${this.varCounter++}`;
     }
-    
+
     const key = `${scopeId}_${varId}`;
     if (!this.scopeVarNames) {
       this.scopeVarNames = new Map();
     }
-    
+
     if (!this.scopeVarNames.has(key)) {
       this.scopeVarNames.set(key, `var_${this.varCounter++}`);
     }
@@ -67,12 +68,13 @@ export class CodeGenerator {
   }
 
   generate() {
-    const { loops, conditionals, addrToIdx } = this.analyzeControlFlow();
-    
+    const { loops } = this.analyzeControlFlow();
+
     const cfg = this.cfReconstructor.buildCFGRegions();
     const regionsByCondIdx = this.cfReconstructor.buildRegionMap(cfg);
     const { loopsByInitJump, loopsByCondJump } = this.cfReconstructor.buildLoopMaps(loops);
-    
+    const ternaries = this.cfReconstructor.detectTernaryExpressions(regionsByCondIdx);
+
     this.usedLabels = this.cfReconstructor.findUsedLabels(loops, regionsByCondIdx);
 
     const stack = [];
@@ -84,10 +86,10 @@ export class CodeGenerator {
     while (i < this.instructions.length) {
       const instr = this.instructions[i];
       const nextInstr = this.instructions[i + 1];
-      
+
       if (loopsByInitJump.has(i)) {
         const loop = loopsByInitJump.get(i);
-        
+
         const condStack = [];
         for (let c = loop.condStartIdx; c <= loop.condEndIdx; c++) {
           const condInstr = this.instructions[c];
@@ -96,20 +98,20 @@ export class CodeGenerator {
           }
         }
         const condition = condStack.pop() || 'true';
-        
+
         this.emitter.emitWhileStart(condition);
-        
+
         const loopStack = this.stackMachine.clone(stack);
         for (let b = loop.bodyStartIdx; b < loop.condStartIdx; b++) {
           const bodyInstr = this.instructions[b];
           const bodyNextInstr = this.instructions[b + 1];
-          
+
           try {
             this.processInstruction(bodyInstr, loopStack);
           } catch (e) {
             this.emitter.emitError(`Error: ${e.message}`);
           }
-          
+
           if (callOps.has(bodyInstr.opName) && loopStack.length > 0) {
             if (!bodyNextInstr || !consumeOps.has(bodyNextInstr.opName) || b + 1 >= loop.condStartIdx) {
               const callResult = loopStack.pop();
@@ -119,56 +121,78 @@ export class CodeGenerator {
             }
           }
         }
-        
+
         for (let s = 0; s < loopStack.length; s++) {
           const expr = loopStack[s];
           if (expr && !this.stackMachine.isTrivialValue(expr)) {
             this.emitter.emitExpression(expr);
           }
         }
-        
+
         this.emitter.emitWhileEnd();
-        
+
         i = loop.condJumpIdx + 1;
         continue;
       }
-      
+
       if (loopsByCondJump.has(i)) {
         i++;
         continue;
       }
-      
+
+      if (ternaries.has(i)) {
+        const ternary = ternaries.get(i);
+        const condition = stack.pop() || 'true';
+
+        const trueStack = this.stackMachine.clone(stack);
+        this.processBlockSequence(ternary.trueBlocks, trueStack, callOps, consumeOps, true);
+        const consequent = trueStack.pop() || 'undefined';
+
+        const falseStack = this.stackMachine.clone(stack);
+        this.processBlockSequence(ternary.falseBlocks, falseStack, callOps, consumeOps, true);
+        const alternate = falseStack.pop() || 'undefined';
+
+        stack.push(`(${condition} ? ${consequent} : ${alternate})`);
+
+        if (ternary.mergeBlock) {
+          i = ternary.mergeBlock.startIdx;
+        } else {
+          i = ternary.endIdx;
+        }
+        continue;
+      }
+
       if (regionsByCondIdx.has(i)) {
         const region = regionsByCondIdx.get(i);
         const condition = stack.pop() || 'true';
-        
+
         const hasTrueBody = region.trueBlocks && region.trueBlocks.length > 0;
         const hasFalseBody = region.falseBlocks && region.falseBlocks.length > 0;
-        
+
         if (hasTrueBody || hasFalseBody) {
           this.emitter.emitIfStart(condition);
-          
+
           if (hasTrueBody) {
             const trueStack = this.stackMachine.clone(stack);
             this.processBlockSequence(region.trueBlocks, trueStack, callOps, consumeOps);
             this.emitRemainingStack(trueStack, stack.length);
           }
-          
+
           this.indent--;
-          
+
           if (hasFalseBody) {
             this.emitter.emit('} else {');
             this.indent++;
-            
+
             const falseStack = this.stackMachine.clone(stack);
             this.processBlockSequence(region.falseBlocks, falseStack, callOps, consumeOps);
             this.emitRemainingStack(falseStack, stack.length);
-            
+
             this.indent--;
           }
-          
+
           this.emitter.emit('}');
-          
+
           if (region.mergeBlock) {
             i = region.mergeBlock.startIdx;
           } else {
@@ -177,7 +201,7 @@ export class CodeGenerator {
           continue;
         }
       }
-      
+
       if (this.usedLabels.has(instr.addr)) {
         this.emitter.emitLabel(this.generateLabel(instr.addr));
       }
@@ -187,7 +211,7 @@ export class CodeGenerator {
       } catch (e) {
         this.emitter.emitError(`Error processing ${instr.opName}: ${e.message}`);
       }
-      
+
       if (callOps.has(instr.opName) && stack.length > 0) {
         if (nextInstr && !consumeOps.has(nextInstr.opName)) {
           const callResult = stack.pop();
@@ -196,7 +220,7 @@ export class CodeGenerator {
           }
         }
       }
-      
+
       i++;
     }
 
@@ -214,19 +238,19 @@ export class CodeGenerator {
     return this.output.join('\n');
   }
 
-  processBlockSequence(blocks, blockStack, callOps, consumeOps) {
+  processBlockSequence(blocks, blockStack, callOps, consumeOps, isTernary = false) {
     for (const block of blocks) {
       for (let b = 0; b < block.instructions.length; b++) {
         const blockInstr = block.instructions[b];
         if (blockInstr.opName === 'JUMP' && b === block.instructions.length - 1) continue;
-        
+
         try {
           this.processInstruction(blockInstr, blockStack);
         } catch (e) {
           this.emitter.emitError(`Error: ${e.message}`);
         }
-        
-        if (callOps.has(blockInstr.opName) && blockStack.length > 0) {
+
+        if (!isTernary && callOps.has(blockInstr.opName) && blockStack.length > 0) {
           const nextBlockInstr = block.instructions[b + 1];
           if (!nextBlockInstr || !consumeOps.has(nextBlockInstr.opName)) {
             const result = blockStack.pop();
@@ -250,7 +274,8 @@ export class CodeGenerator {
 
   processInstruction(instr, stack) {
     const sm = this.stackMachine;
-    
+    const swapped = this.swappedOpcodes.has(instr.opcode);
+
     switch (instr.opName) {
       case 'STACK_PUSH_STRING':
         stack.push(sm.formatString(instr));
@@ -289,87 +314,87 @@ export class CodeGenerator {
         break;
 
       case 'ARITHMETIC_ADD':
-        sm.buildBinaryExpression(stack, '+');
+        sm.buildBinaryExpression(stack, '+', swapped);
         break;
 
       case 'ARITHMETIC_SUB':
-        sm.buildBinaryExpression(stack, '-');
+        sm.buildBinaryExpression(stack, '-', swapped);
         break;
 
       case 'ARITHMETIC_MUL':
-        sm.buildBinaryExpression(stack, '*');
+        sm.buildBinaryExpression(stack, '*', swapped);
         break;
 
       case 'ARITHMETIC_DIV':
-        sm.buildBinaryExpression(stack, '/');
+        sm.buildBinaryExpression(stack, '/', swapped);
         break;
 
       case 'ARITHMETIC_MOD':
-        sm.buildBinaryExpression(stack, '%');
+        sm.buildBinaryExpression(stack, '%', swapped);
         break;
 
       case 'COMPARISON_EQUAL':
-        sm.buildBinaryExpression(stack, '==');
+        sm.buildBinaryExpression(stack, '==', swapped);
         break;
 
       case 'COMPARISON_STRICT_EQUAL':
-        sm.buildBinaryExpression(stack, '===');
+        sm.buildBinaryExpression(stack, '===', swapped);
         break;
 
       case 'COMPARISON_NOT_EQUAL':
-        sm.buildBinaryExpression(stack, '!=');
+        sm.buildBinaryExpression(stack, '!=', swapped);
         break;
 
       case 'COMPARISON_STRICT_NOT_EQUAL':
-        sm.buildBinaryExpression(stack, '!==');
+        sm.buildBinaryExpression(stack, '!==', swapped);
         break;
 
       case 'COMPARISON_LESS':
-        sm.buildBinaryExpression(stack, '<');
+        sm.buildBinaryExpression(stack, '<', swapped);
         break;
 
       case 'COMPARISON_LESS_OR_EQUAL':
-        sm.buildBinaryExpression(stack, '<=');
+        sm.buildBinaryExpression(stack, '<=', swapped);
         break;
 
       case 'COMPARISON_GREATER':
-        sm.buildBinaryExpression(stack, '>');
+        sm.buildBinaryExpression(stack, '>', swapped);
         break;
 
       case 'COMPARISON_GREATER_OR_EQUAL':
-        sm.buildBinaryExpression(stack, '>=');
+        sm.buildBinaryExpression(stack, '>=', swapped);
         break;
 
       case 'BINARY_BIT_SHIFT_LEFT':
-        sm.buildBinaryExpression(stack, '<<');
+        sm.buildBinaryExpression(stack, '<<', swapped);
         break;
 
       case 'BINARY_BIT_SHIFT_RIGHT':
-        sm.buildBinaryExpression(stack, '>>');
+        sm.buildBinaryExpression(stack, '>>', swapped);
         break;
 
       case 'BINARY_UNSIGNED_BIT_SHIFT_RIGHT':
-        sm.buildBinaryExpression(stack, '>>>');
+        sm.buildBinaryExpression(stack, '>>>', swapped);
         break;
 
       case 'BINARY_BIT_XOR':
-        sm.buildBinaryExpression(stack, '^');
+        sm.buildBinaryExpression(stack, '^', swapped);
         break;
 
       case 'BINARY_BIT_AND':
-        sm.buildBinaryExpression(stack, '&');
+        sm.buildBinaryExpression(stack, '&', swapped);
         break;
 
       case 'BINARY_BIT_OR':
-        sm.buildBinaryExpression(stack, '|');
+        sm.buildBinaryExpression(stack, '|', swapped);
         break;
 
       case 'BINARY_IN':
-        sm.buildBinaryExpression(stack, 'in', '""', '{}');
+        sm.buildBinaryExpression(stack, 'in', swapped, '""', '{}');
         break;
 
       case 'BINARY_INSTANCEOF':
-        sm.buildBinaryExpression(stack, 'instanceof', 'null', 'Object');
+        sm.buildBinaryExpression(stack, 'instanceof', swapped, 'null', 'Object');
         break;
 
       case 'UNARY_PLUS':

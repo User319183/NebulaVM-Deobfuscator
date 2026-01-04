@@ -1,10 +1,10 @@
 /**
  * Stack Machine Emulator
- * 
+ *
  * Emulates the VM's operand stack during symbolic execution.
  * This module handles stack operations and expression building
  * for the decompilation process.
- * 
+ *
  * Key concepts:
  * - Symbolic execution: Tracking symbolic values through stack operations
  * - Operand stack: The VM's evaluation stack that holds intermediate values
@@ -19,14 +19,6 @@ export class StackMachine {
   /**
    * Stack Operations - Core stack manipulation during symbolic execution
    */
-  push(stack, value) {
-    stack.push(value);
-  }
-
-  pop(stack) {
-    return stack.pop();
-  }
-
   peek(stack) {
     return stack.length > 0 ? stack[stack.length - 1] : undefined;
   }
@@ -53,11 +45,29 @@ export class StackMachine {
   /**
    * Expression Building - Constructs JavaScript expressions from stack operands
    * These operations lift low-level VM operations to high-level expressions
+   *
+   * Normal handlers do: push(pop() OP pop()) = first_pop OP second_pop
+   * Swapped handlers do: n = pop(); push(pop() OP n) = second_pop OP first_pop
+   *
+   * We pop in same order (first=top, second=next), but emit differently:
+   * - Normal: second OP first (because normal handler uses first_pop OP second_pop)
+   * - Swapped: first OP second (because swapped handler uses second_pop OP first_pop,
+   *   but we want the same semantic output as normal)
+   *
+   * Actually, the semantic meaning is preserved when we emit the same expression
+   * that matches what the handler computes. So:
+   * - Normal: handler computes first_pop OP second_pop, emit (first OP second)
+   * - Swapped: handler computes second_pop OP first_pop, emit (second OP first)
    */
-  buildBinaryExpression(stack, operator, leftDefault = '0', rightDefault = '0') {
-    const left = stack.pop() || leftDefault;
-    const right = stack.pop() || rightDefault;
-    stack.push(`(${left} ${operator} ${right})`);
+  buildBinaryExpression(stack, operator, swapped = false, leftDefault = '0', rightDefault = '0') {
+    const first = stack.pop() || leftDefault;   // first pop = top of stack
+    const second = stack.pop() || rightDefault; // second pop = next on stack
+
+    if (swapped) {
+      stack.push(`(${second} ${operator} ${first})`);
+    } else {
+      stack.push(`(${first} ${operator} ${second})`);
+    }
   }
 
   buildUnaryExpression(stack, operator, defaultVal = '0') {
@@ -68,12 +78,12 @@ export class StackMachine {
   buildPropertyAccess(stack) {
     const key = stack.pop() || 'prop';
     const obj = stack.pop() || 'obj';
-    
+
     let propName = key;
     if (key.startsWith('"') || key.startsWith("'")) {
       propName = key.slice(1, -1);
     }
-    
+
     if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(propName) && key !== propName) {
       stack.push(`${obj}.${propName}`);
     } else {
@@ -88,12 +98,12 @@ export class StackMachine {
     for (let j = 0; j < argc; j++) {
       args.push(stack.pop() || 'undefined');
     }
-    
+
     let methodName = key;
     if (key.startsWith('"') || key.startsWith("'")) {
       methodName = key.slice(1, -1);
     }
-    
+
     if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(methodName)) {
       stack.push(`${obj}.${methodName}(${args.join(', ')})`);
     } else {
@@ -132,12 +142,12 @@ export class StackMachine {
     for (let j = 0; j < length; j++) {
       const value = stack.pop() || 'undefined';
       const key = stack.pop() || '"key"';
-      
+
       let keyStr = key;
       if (key.startsWith('"') || key.startsWith("'")) {
         keyStr = key.slice(1, -1);
       }
-      
+
       if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(keyStr)) {
         props.push(`${keyStr}: ${value}`);
       } else {
@@ -194,7 +204,7 @@ export class StackMachine {
     const scopeId = instr.args[1]?.value;
     const dest = instr.args[2]?.value;
     const varName = getVarName(scopeId, dest);
-    
+
     if (isOperation && instr.args[3]) {
       const assignOp = instr.args[3].value;
       const opMap = {

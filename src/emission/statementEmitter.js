@@ -1,9 +1,9 @@
 /**
  * Statement Emitter
- * 
+ *
  * Lifts stack-based IR back to high-level JavaScript statements.
  * This module generates JavaScript source code from symbolic execution results.
- * 
+ *
  * Key concepts:
  * - Lifting: Converting low-level IR (intermediate representation) to high-level code
  * - Statement emission: Producing syntactically correct JavaScript statements
@@ -46,7 +46,7 @@ export class StatementEmitter {
     if (key.startsWith('"') || key.startsWith("'")) {
       propName = key.slice(1, -1);
     }
-    
+
     if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(propName) && key !== propName) {
       this.emit(`${obj}.${propName} = ${value};`);
     } else {
@@ -163,13 +163,13 @@ export class StatementEmitter {
         opcodeMap
       );
       const subInstructions = subDisasm.disassemble();
-      
+
       const CodeGenerator = this.generator.constructor;
       const subGen = new CodeGenerator(subInstructions, strings, opcodeMap);
       subGen.varCounter = varCounter;
       subGen.indent = currentIndent + 1;
       const fnBody = subGen.generate();
-      
+
       const fnLines = fnBody.split('\n').map(l => '  ' + l).join('\n');
       return {
         code: `function() {\n${fnLines}\n${'  '.repeat(currentIndent)}}`,
@@ -196,7 +196,7 @@ export class StatementEmitter {
   getConsumeOps() {
     return new Set([
       'ARITHMETIC_ADD', 'ARITHMETIC_SUB', 'ARITHMETIC_MUL', 'ARITHMETIC_DIV', 'ARITHMETIC_MOD',
-      'COMPARISON_EQUAL', 'COMPARISON_STRICT_EQUAL', 'COMPARISON_NOT_EQUAL', 
+      'COMPARISON_EQUAL', 'COMPARISON_STRICT_EQUAL', 'COMPARISON_NOT_EQUAL',
       'COMPARISON_STRICT_NOT_EQUAL', 'COMPARISON_LESS', 'COMPARISON_LESS_OR_EQUAL',
       'COMPARISON_GREATER', 'COMPARISON_GREATER_OR_EQUAL',
       'BINARY_BIT_AND', 'BINARY_BIT_OR', 'BINARY_BIT_XOR',

@@ -3,13 +3,13 @@
 /**
  * NebulaVM Deobfuscator - CLI Entry Point
  * =========================================
- * 
+ *
  * This tool implements a complete deobfuscation pipeline for JavaScript code
  * protected by the NebulaVM obfuscator. The pipeline transforms virtualized
  * bytecode back into readable JavaScript source code.
- * 
+ *
  * Deobfuscation Pipeline Overview:
- * 
+ *
  * ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
  * │  Obfuscated JS  │───▶│   Extraction    │───▶│  Disassembly    │───▶│ Code Generation │
  * │    (Input)      │    │     Phase       │    │     Phase       │    │     Phase       │
@@ -20,19 +20,19 @@
  *                        - String table           decoding         - Stack simulation
  *                        - Opcode mapping       - Operand fetch    - AST reconstruction
  *                        - VM dispatcher        - Nested functions - Semantic recovery
- * 
+ *
  * Phase 1: Bytecode Extraction
  * - Parse obfuscated JavaScript to locate VM dispatcher
  * - Extract embedded bytecode array (compressed or raw)
  * - Recover string table for string literal resolution
  * - Decode shuffled opcode mapping table
- * 
+ *
  * Phase 2: Disassembly
  * - Decompress bytecode if zlib-compressed
  * - Decode instruction stream using opcode dispatch
  * - Extract operands for each instruction type
  * - Handle nested VM contexts (embedded functions)
- * 
+ *
  * Phase 3: Code Generation (Semantic Recovery)
  * - Build Control Flow Graph from instruction stream
  * - Simulate stack machine to recover expressions
@@ -89,7 +89,7 @@ program
       }
 
       const resolvedPath = path.resolve(inputPath);
-      
+
       if (!fs.existsSync(resolvedPath)) {
         console.error(chalk.red(`Error: File not found: ${resolvedPath}`));
         process.exit(1);
@@ -101,13 +101,13 @@ program
       }).start();
 
       const code = fs.readFileSync(resolvedPath, 'utf-8');
-      
+
       if (options.verbose) {
         spinner.info(`Input file size: ${(code.length / 1024).toFixed(2)} KB`);
       }
 
       spinner.text = 'Extracting bytecode and strings...';
-      
+
       let extracted;
       try {
         extracted = extractFromCode(code);
@@ -117,7 +117,7 @@ program
         process.exit(1);
       }
 
-      const { bytecode, strings, opcodeMap, returnOpcode } = extracted;
+      const { bytecode, strings, opcodeMap, swappedOpcodes, returnOpcode } = extracted;
 
       if (options.verbose) {
         spinner.info(`Bytecode size: ${bytecode.length} bytes`);
@@ -147,7 +147,7 @@ program
 
       const disassembler = new Disassembler(bytecode, strings, opcodeMap, returnOpcode);
       let instructions;
-      
+
       try {
         instructions = disassembler.disassemble();
       } catch (e) {
@@ -163,11 +163,11 @@ program
       if (options.disasm) {
         spinner.succeed(chalk.green('Disassembly complete'));
         console.log(chalk.cyan('\n=== Disassembled Bytecode ===\n'));
-        
+
         for (const instr of instructions) {
           let line = chalk.gray(`${String(instr.addr).padStart(6, '0')}:`) + ' ';
           line += chalk.yellow(instr.opName.padEnd(30));
-          
+
           if (instr.args.length > 0) {
             const argStr = instr.args.map(a => {
               if (a.type === 'string_index') {
@@ -177,11 +177,11 @@ program
             }).join(', ');
             line += argStr;
           }
-          
+
           if (instr.error) {
             line += chalk.red(` [ERROR: ${instr.error}]`);
           }
-          
+
           console.log(line);
         }
         return;
@@ -189,9 +189,9 @@ program
 
       spinner.text = 'Generating JavaScript code...';
 
-      const generator = new CodeGenerator(instructions, strings, opcodeMap, returnOpcode);
+      const generator = new CodeGenerator(instructions, strings, opcodeMap, returnOpcode, swappedOpcodes);
       let output;
-      
+
       try {
         output = generator.generate();
       } catch (e) {
@@ -227,9 +227,9 @@ function cleanupOutput(code) {
   if (!code || typeof code !== 'string') {
     return '// No code generated';
   }
-  
+
   let lines = code.split('\n');
-  
+
   lines = lines.filter(line => {
     const trimmed = line.trim();
     if (trimmed === 'undefined;' || trimmed === 'null;') return false;

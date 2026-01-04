@@ -89,6 +89,14 @@ src/
 - Complex nested control flow may use label-based fallback
 - Works best with standard NebulaVM output
 
+## Changelog
+
+### 2026-01-04
+
+- **Operand order randomization support** - NebulaVM randomizes not just opcodes but also operand order in binary operations (comparisons, arithmetic, bitwise). Added detection for the "temp-variable pattern" (`var n = pop(); push(pop() OP n)`) to identify swapped operand handlers, fixing incorrect expression reconstruction.
+- **Ternary expression support** - Added detection for NebulaVM's `ConditionalExpressionCompiler` pattern (`JUMP_IF_FALSE` + `JUMP`). The deobfuscator now reconstructs `a ? b : c` ternary expressions instead of converting them to if-else statements.
+- **Codebase optimization** - Removed unused classes, methods, parameters, and simplified internal control flow analysis.
+
 ## Disclaimer
 
 This tool is provided for **educational and security research purposes only**. 

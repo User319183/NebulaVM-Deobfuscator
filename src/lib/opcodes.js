@@ -1,70 +1,70 @@
 /**
  * NebulaVM Instruction Set Architecture (ISA) Definitions
  * =========================================================
- * 
+ *
  * This module defines the complete opcode set for the Nebula Virtual Machine.
  * NebulaVM is a stack-based virtual machine that executes JavaScript semantics
  * through a custom bytecode format. Understanding this ISA is essential for
  * reverse engineering obfuscated code.
- * 
+ *
  * Stack Machine Architecture:
  * - Operands are pushed onto an evaluation stack before operations
  * - Operations pop operands, compute results, and push results back
  * - No general-purpose registers; all computation uses the stack
- * 
+ *
  * Opcode Handler Taxonomy:
- * 
+ *
  * 1. STACK OPERATIONS (0-7): Stack manipulation primitives
  *    - Push literals (string, number, boolean, null, undefined)
  *    - Stack management (duplicate, pop)
- * 
+ *
  * 2. ARITHMETIC OPERATIONS (8-12): Binary math operators
  *    - Instruction semantics: pop two operands, push result
  *    - Implements: +, -, *, /, %
- * 
+ *
  * 3. COMPARISON OPERATIONS (13-20): Relational operators
  *    - Instruction semantics: pop two operands, push boolean result
  *    - Implements: ==, ===, !=, !==, <, <=, >, >=
- * 
+ *
  * 4. BINARY/BITWISE OPERATIONS (21-28): Bit manipulation and type operators
  *    - Shift operations: <<, >>, >>>
  *    - Logical: ^, &, |
  *    - Type operators: in, instanceof
- * 
+ *
  * 5. UNARY OPERATIONS (29-35): Single-operand operators
  *    - Arithmetic: +x, -x
  *    - Logical: !x, ~x
  *    - Type/control: typeof, void, throw
- * 
+ *
  * 6. UPDATE OPERATIONS (36-41): Increment/decrement operators
  *    - Variable updates: ++x, x++, --x, x--
  *    - Property updates: obj.prop++, obj.prop--
  *    - Complex property updates: obj[expr]++
- * 
+ *
  * 7. VARIABLE OPERATIONS (42-55): Variable access and assignment
  *    - Load/store by scope ID and slot index
  *    - Compound assignments: +=, -=, *=, /=, etc.
- * 
+ *
  * 8. CONTEXT OPERATIONS (56-60): Execution context access
  *    - Global object, this binding, arguments object
- * 
+ *
  * 9. CALL OPERATIONS (61-63): Function invocation
  *    - Function calls, method calls, constructor calls (new)
- * 
+ *
  * 10. PROPERTY OPERATIONS (64-65): Object property access
  *     - Get and set object properties
- * 
+ *
  * 11. BUILD OPERATIONS (66-68): Object/function construction
  *     - Array literals, object literals, function expressions
  *     - BUILD_FUNCTION contains nested VM context (embedded bytecode)
- * 
+ *
  * 12. CONTROL FLOW (69-71): Branch and jump instructions
  *     - Unconditional jump, conditional branches
  *     - Target addresses are bytecode offsets
- * 
+ *
  * 13. RETURN (72): Function exit
  *     - Pops return value (if any) and exits current VM context
- * 
+ *
  * 14. DEBUG (73): Debugger statement
  *     - Triggers debugger breakpoint
  */
