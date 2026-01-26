@@ -10,6 +10,7 @@
  */
 
 import { Disassembler } from '../lib/disassembler.js';
+import { NebulaVersion } from '../runtime/bytecodeReader.js';
 
 export class StatementEmitter {
   constructor(codeGenerator) {
@@ -157,12 +158,31 @@ export class StatementEmitter {
    */
   buildFunctionBody(instr, strings, opcodeMap, currentIndent, varCounter) {
     if (instr.fnBody) {
-      const subDisasm = new Disassembler(
-        new Uint8Array([0, ...instr.fnBody]),
-        strings,
-        opcodeMap
-      );
-      const subInstructions = subDisasm.disassemble();
+      const parentVersion = instr.detectedVersion;
+
+      let subDisasm;
+      let subInstructions;
+
+      if (parentVersion === NebulaVersion.V2_CURRENT) {
+        // V2: Function bodies are raw bytecode, no compression flag
+        subDisasm = new Disassembler(
+          new Uint8Array(instr.fnBody),
+          strings,
+          opcodeMap,
+          null,
+          parentVersion
+        );
+        subDisasm.pointer = 0;
+        subInstructions = subDisasm.disassembleWithoutVersionDetect();
+      } else {
+        // V1: Function bodies need compression flag prepended (0 = uncompressed)
+        subDisasm = new Disassembler(
+          new Uint8Array([0, ...instr.fnBody]),
+          strings,
+          opcodeMap
+        );
+        subInstructions = subDisasm.disassemble();
+      }
 
       const CodeGenerator = this.generator.constructor;
       const subGen = new CodeGenerator(subInstructions, strings, opcodeMap);
@@ -177,6 +197,40 @@ export class StatementEmitter {
       };
     }
     return { code: 'function() {}', newVarCounter: varCounter };
+  }
+
+  /**
+   * Emit try statement start
+   */
+  emitTryStart() {
+    this.emit('try {');
+    this.generator.indent++;
+  }
+
+  /**
+   * Emit catch clause start
+   */
+  emitCatchStart(errVarName) {
+    this.generator.indent--;
+    this.emit(`} catch (${errVarName}) {`);
+    this.generator.indent++;
+  }
+
+  /**
+   * Emit finally clause start
+   */
+  emitFinallyStart() {
+    this.generator.indent--;
+    this.emit('} finally {');
+    this.generator.indent++;
+  }
+
+  /**
+   * Emit try block end (closing brace)
+   */
+  emitTryEnd() {
+    this.generator.indent--;
+    this.emit('}');
   }
 
   /**

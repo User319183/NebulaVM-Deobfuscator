@@ -47,6 +47,69 @@
 const BASE64_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
 /**
+ * NebulaVM Version Detection
+ *
+ * The obfuscator has evolved over time with different bytecode formats:
+ *
+ * VERSION 1 (Legacy - before Jan 21, 2026):
+ *   - Compression flag at START of bytecode (first byte)
+ *   - Uses zlib/pako compression
+ *   - Operand order may be randomized (temp-variable pattern)
+ *
+ * VERSION 2 (Current - Jan 21, 2026+):
+ *   - Compression flag at END of bytecode (last byte)
+ *   - Uses custom LZ77 compression
+ *   - Consistent operand order (left, right)
+ *   - New opcodes: BUILD_REGEXP, TRY_*, LOAD_ARGUMENTS
+ */
+export const NebulaVersion = {
+  V1_LEGACY: 1,
+  V2_CURRENT: 2,
+};
+
+/**
+ * Decompresses LZ77-encoded bytecode (NebulaVM v2 format)
+ *
+ * LZ77 format used by NebulaVM:
+ *   - 0, length, offset_lo, offset_hi: Copy `length` bytes from position (current - offset)
+ *   - 1, byte: Literal byte
+ *
+ * @param {Uint8Array} compressed - LZ77 compressed bytecode
+ * @returns {Uint8Array} Decompressed bytecode
+ */
+export function decompressLZ77(compressed) {
+  const output = [];
+  let i = 0;
+
+  while (i < compressed.length) {
+    const marker = compressed[i++];
+
+    if (marker === 0) {
+      // Match reference: copy from earlier in output
+      if (i + 2 >= compressed.length) break;
+      const length = compressed[i++];
+      const offsetLo = compressed[i++];
+      const offsetHi = compressed[i++];
+      const offset = offsetLo | (offsetHi << 8);
+
+      const startPos = output.length - offset;
+      for (let j = 0; j < length; j++) {
+        output.push(output[startPos + j]);
+      }
+    } else if (marker === 1) {
+      // Literal byte
+      if (i >= compressed.length) break;
+      output.push(compressed[i++]);
+    } else {
+      // Unknown marker - treat as literal (fallback)
+      output.push(marker);
+    }
+  }
+
+  return new Uint8Array(output);
+}
+
+/**
  * Decodes a Base64 encoded string to raw bytes (as string)
  *
  * Base64 encoding uses 6 bits per character, so we:

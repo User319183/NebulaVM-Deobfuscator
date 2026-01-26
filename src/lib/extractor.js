@@ -1,3 +1,10 @@
+/**
+ * Bytecode Extractor
+ *
+ * Extracts bytecode, strings, and opcode mappings from obfuscated NebulaVM code.
+ * Parses the obfuscated JavaScript to locate the embedded VM components.
+ */
+
 import { parse } from '@babel/parser';
 import _traverse from '@babel/traverse';
 import { decodeBytecode, decodeStringsBytes } from '../runtime/bytecodeReader.js';
@@ -101,7 +108,8 @@ export function extractFromCode(code) {
                   swappedOpcodes.add(opcode);
                 }
               }
-            } catch (e) {
+            } catch {
+              // Handler analysis failed - skip this opcode
             }
           }
         }

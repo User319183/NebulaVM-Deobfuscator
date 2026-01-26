@@ -19,10 +19,11 @@
  */
 
 import { OperationCode, OpcodeNames } from './opcodes.js';
+import { NebulaVersion, decompressLZ77 } from '../runtime/bytecodeReader.js';
 import pako from 'pako';
 
 export class Disassembler {
-  constructor(bytecode, strings, opcodeMap, returnOpcode = null) {
+  constructor(bytecode, strings, opcodeMap, returnOpcode = null, parentVersion = null) {
     this.bytecode = bytecode;
     this.strings = strings;
     this.opcodeMap = opcodeMap;
@@ -30,6 +31,7 @@ export class Disassembler {
     this.reverseOpcodeMap = this.buildReverseOpcodeMap();
     this.pointer = 0;
     this.instructions = [];
+    this.detectedVersion = parentVersion;
   }
 
   /**
@@ -114,10 +116,90 @@ export class Disassembler {
   }
 
   /**
+   * Detect NebulaVM version and decompress bytecode accordingly.
+   *
+   * Version detection strategy:
+   * - V1 (Legacy): Compression flag at START, uses zlib/pako
+   * - V2 (Current): Compression flag at END, uses custom LZ77
+   *
+   * Try V2 format first (check last byte), then fall back to V1.
+   */
+  detectVersionAndDecompress() {
+    const lastByte = this.bytecode[this.bytecode.length - 1];
+    const firstByte = this.bytecode[0];
+
+    // Try V2 format: compression flag at end
+    if (lastByte === 0 || lastByte === 1) {
+      const isCompressedV2 = lastByte === 1;
+      if (isCompressedV2) {
+        // V2 with LZ77 compression
+        const compressedData = this.bytecode.slice(0, -1);
+        try {
+          const decompressed = decompressLZ77(compressedData);
+          if (decompressed.length > 0 && this.looksLikeBytecode(decompressed)) {
+            this.bytecode = decompressed;
+            this.pointer = 0;
+            this.detectedVersion = NebulaVersion.V2_CURRENT;
+            return;
+          }
+        } catch (err) {
+          // Fall through to V1
+        }
+      } else {
+        // V2 uncompressed: just strip the last byte
+        const uncompressedData = this.bytecode.slice(0, -1);
+        if (this.looksLikeBytecode(uncompressedData)) {
+          this.bytecode = uncompressedData;
+          this.pointer = 0;
+          this.detectedVersion = NebulaVersion.V2_CURRENT;
+          return;
+        }
+      }
+    }
+
+    // Try V1 format: compression flag at start
+    const isCompressedV1 = firstByte === 1;
+    this.pointer = 1; // Skip compression flag
+    if (isCompressedV1) {
+      const compressedData = this.bytecode.slice(1);
+      try {
+        const decompressed = pako.inflate(compressedData);
+        this.bytecode = decompressed;
+        this.pointer = 0;
+        this.detectedVersion = NebulaVersion.V1_LEGACY;
+        return;
+      } catch (err) {
+        // Reset and try uncompressed
+        this.pointer = 1;
+      }
+    }
+
+    // V1 uncompressed
+    this.detectedVersion = NebulaVersion.V1_LEGACY;
+  }
+
+  /**
+   * Heuristic check if data looks like valid NebulaVM bytecode.
+   * Uses the opcode map to verify the first byte is a known opcode.
+   * This helps distinguish V1 (compression flag at start) from V2 (flag at end).
+   */
+  looksLikeBytecode(data) {
+    if (data.length < 4) return false;
+    // The first byte should be a known opcode from our opcode map
+    const firstByte = data[0];
+    const isKnownOpcode = firstByte in this.opcodeMap;
+    if (!isKnownOpcode) return false;
+    // Additional check: sample first few bytes for reasonable opcode distribution
+    const sample = data.slice(0, Math.min(20, data.length));
+    const validOpcodes = sample.filter(b => b >= 0 && b <= 80);
+    return validOpcodes.length >= sample.length * 0.3;
+  }
+
+  /**
    * Main disassembly loop: Decode bytecode stream into instruction objects.
    *
    * Algorithm:
-   * 1. Check compression flag and decompress if needed
+   * 1. Detect version and decompress if needed
    * 2. Iterate through bytecode until end of stream
    * 3. For each instruction:
    *    a. Record current address (IP before fetch)
@@ -126,17 +208,7 @@ export class Disassembler {
    *    d. Build instruction object with address, opcode, name, and args
    */
   disassemble() {
-    const isCompressed = this.readInstruction();
-    if (isCompressed) {
-      const compressedData = this.bytecode.slice(this.pointer);
-      try {
-        const decompressed = pako.inflate(compressedData);
-        this.bytecode = decompressed;
-        this.pointer = 0;
-      } catch (err) {
-        throw new Error(`Failed to decompress bytecode: ${err.message}`);
-      }
-    }
+    this.detectVersionAndDecompress();
 
     while (this.pointer < this.bytecode.length) {
       const addr = this.pointer;
@@ -176,10 +248,12 @@ export class Disassembler {
           case 'STACK_PUSH_UNDEFINED':
           case 'STACK_PUSH_DUPLICATE':
           case 'STACK_POP':
+          case 'SEQUENCE_POP':
           case 'LOAD_THIS':
           case 'LOAD_GLOBAL':
           case 'LOAD_ARGUMENTS':
           case 'DEBUGGER':
+          case 'TRY_POP':
             break;
 
           case 'ARITHMETIC_ADD':
@@ -309,6 +383,8 @@ export class Disassembler {
             }
             instr.args.push({ type: 'fn_body_length', value: fnBodyLength });
             instr.fnBody = fnBody;
+            // Store version for nested disassembly
+            instr.detectedVersion = this.detectedVersion;
             break;
           }
 
@@ -325,6 +401,225 @@ export class Disassembler {
             instr.args.push({ type: 'has_value', value: hasValue === 1 });
             break;
           }
+
+          case 'BUILD_REGEXP': {
+            if (this.detectedVersion === NebulaVersion.V2_CURRENT) {
+              // V2: reads 1 byte (has_flags), pattern and flags come from stack
+              const hasFlags = this.readInstruction();
+              instr.args.push({ type: 'has_flags', value: hasFlags === 1 });
+              // Pattern and flags will be popped from stack during code generation
+            } else {
+              // V1: reads 2 dwords (pattern_index, flags_index)
+              const patternIdx = this.readDword();
+              const flagsIdx = this.readDword();
+              instr.args.push({ type: 'pattern_index', value: patternIdx });
+              instr.args.push({ type: 'flags_index', value: flagsIdx });
+              instr.patternValue = this.strings[patternIdx] || `[pattern_${patternIdx}]`;
+              instr.flagsValue = this.strings[flagsIdx] || '';
+            }
+            break;
+          }
+
+          case 'TRY_PUSH': {
+            if (this.detectedVersion === NebulaVersion.V2_CURRENT) {
+              // V2: reads 1 dword (catch_addr only), stack length recorded at runtime
+              const catchAddr = this.readDword();
+              instr.args.push({ type: 'catch_addr', value: catchAddr });
+            } else {
+              // V1: reads 2 dwords (catch_addr, finally_addr)
+              const catchAddr = this.readDword();
+              const finallyAddr = this.readDword();
+              instr.args.push({ type: 'catch_addr', value: catchAddr });
+              instr.args.push({ type: 'finally_addr', value: finallyAddr });
+            }
+            break;
+          }
+
+          case 'TRY_CATCH': {
+            const scopeId = this.readDword();
+            const varSlot = this.readDword();
+            instr.args.push({ type: 'scope', value: scopeId });
+            instr.args.push({ type: 'var_slot', value: varSlot });
+            break;
+          }
+
+          case 'TRY_FINALLY':
+            break;
+
+          default:
+            break;
+        }
+      } catch (e) {
+        instr.error = e.message;
+      }
+
+      this.instructions.push(instr);
+    }
+
+    return this.instructions;
+  }
+
+  /**
+   * Disassemble without version detection - used for nested function bodies
+   * that inherit version from parent disassembler.
+   */
+  disassembleWithoutVersionDetect() {
+    // Skip version detection, Just disassemble raw bytecode
+    while (this.pointer < this.bytecode.length) {
+      const addr = this.pointer;
+      const opcode = this.readInstruction();
+      const opName = this.getOpcodeName(opcode);
+
+      const instr = { addr, opcode, opName, args: [] };
+
+      try {
+        switch (opName) {
+          case 'STACK_PUSH_STRING': {
+            const idx = this.readDword();
+            instr.args.push({ type: 'string_index', value: idx });
+            instr.stringValue = this.strings[idx] || `[string_${idx}]`;
+            break;
+          }
+
+          case 'STACK_PUSH_DWORD': {
+            const val = this.readSignedDword();
+            instr.args.push({ type: 'dword', value: val });
+            break;
+          }
+
+          case 'STACK_PUSH_DOUBLE': {
+            const val = this.readDouble();
+            instr.args.push({ type: 'double', value: val });
+            break;
+          }
+
+          case 'STACK_PUSH_BOOLEAN':
+          case 'STACK_PUSH_NULL':
+          case 'STACK_PUSH_UNDEFINED':
+          case 'STACK_DUPLICATE':
+          case 'STACK_POP':
+          case 'LOAD_THIS':
+          case 'LOAD_GLOBAL':
+          case 'LOAD_ARGUMENTS':
+          case 'DEBUGGER':
+          case 'TRY_POP':
+            break;
+
+          case 'ARITHMETIC_ADD':
+          case 'ARITHMETIC_SUB':
+          case 'ARITHMETIC_MUL':
+          case 'ARITHMETIC_DIV':
+          case 'ARITHMETIC_MOD':
+          case 'COMPARISON_EQUAL':
+          case 'COMPARISON_STRICT_EQUAL':
+          case 'COMPARISON_NOT_EQUAL':
+          case 'COMPARISON_STRICT_NOT_EQUAL':
+          case 'COMPARISON_LESS':
+          case 'COMPARISON_LESS_OR_EQUAL':
+          case 'COMPARISON_GREATER':
+          case 'COMPARISON_GREATER_OR_EQUAL':
+          case 'BINARY_BIT_SHIFT_LEFT':
+          case 'BINARY_BIT_SHIFT_RIGHT':
+          case 'BINARY_UNSIGNED_BIT_SHIFT_RIGHT':
+          case 'BINARY_BIT_XOR':
+          case 'BINARY_BIT_AND':
+          case 'BINARY_BIT_OR':
+          case 'BINARY_IN':
+          case 'BINARY_INSTANCEOF':
+          case 'GET_PROPERTY':
+            break;
+
+          case 'UNARY_PLUS':
+          case 'UNARY_MINUS':
+          case 'UNARY_NOT':
+          case 'UNARY_BIT_NOT':
+          case 'UNARY_TYPEOF':
+          case 'UNARY_VOID':
+          case 'UNARY_THROW':
+            break;
+
+          case 'LOAD_VARIABLE':
+          case 'STORE_VARIABLE': {
+            const scopeId = this.readDword();
+            const dest = this.readDword();
+            instr.args.push({ type: 'scope', value: scopeId });
+            instr.args.push({ type: 'dest', value: dest });
+            break;
+          }
+
+          case 'LOAD_ARGUMENT': {
+            const idx = this.readDword();
+            instr.args.push({ type: 'arg_index', value: idx });
+            break;
+          }
+
+          case 'CALL_FUNCTION':
+          case 'CONSTRUCT':
+          case 'CALL_METHOD': {
+            const argCount = this.readDword();
+            instr.args.push({ type: 'arg_count', value: argCount });
+            break;
+          }
+
+          case 'BUILD_FUNCTION': {
+            const fnBodyLength = this.readDword();
+            const fnBody = [];
+            for (let i = 0; i < fnBodyLength; i++) {
+              fnBody.push(this.readInstruction());
+            }
+            instr.args.push({ type: 'fn_body_length', value: fnBodyLength });
+            instr.fnBody = fnBody;
+            instr.detectedVersion = this.detectedVersion;
+            break;
+          }
+
+          case 'JUMP':
+          case 'JUMP_IF_TRUE':
+          case 'JUMP_IF_FALSE': {
+            const addr = this.readDword();
+            instr.args.push({ type: 'address', value: addr });
+            break;
+          }
+
+          case 'RETURN': {
+            const hasValue = this.readInstruction();
+            instr.args.push({ type: 'has_value', value: hasValue === 1 });
+            break;
+          }
+
+          case 'BUILD_REGEXP': {
+            if (this.detectedVersion === NebulaVersion.V2_CURRENT) {
+              const hasFlags = this.readInstruction();
+              instr.args.push({ type: 'has_flags', value: hasFlags === 1 });
+            } else {
+              const patternIdx = this.readDword();
+              const flagsIdx = this.readDword();
+              instr.args.push({ type: 'pattern_index', value: patternIdx });
+              instr.args.push({ type: 'flags_index', value: flagsIdx });
+              instr.patternValue = this.strings[patternIdx] || `[pattern_${patternIdx}]`;
+              instr.flagsValue = this.strings[flagsIdx] || '';
+            }
+            break;
+          }
+
+          case 'TRY_PUSH': {
+            if (this.detectedVersion === NebulaVersion.V2_CURRENT) {
+              const catchAddr = this.readDword();
+              instr.args.push({ type: 'catch_addr', value: catchAddr });
+            } else {
+              const catchAddr = this.readDword();
+              const finallyAddr = this.readDword();
+              instr.args.push({ type: 'catch_addr', value: catchAddr });
+              instr.args.push({ type: 'finally_addr', value: finallyAddr });
+            }
+            break;
+          }
+
+          case 'LOAD_GLOBAL_PROP':
+          case 'SET_PROPERTY':
+          case 'DELETE_PROPERTY':
+          case 'SEQUENCE_POP':
+            break;
 
           default:
             break;

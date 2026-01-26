@@ -1,18 +1,12 @@
 # NebulaVM Deobfuscator
 
-A command-line tool that reverses JavaScript obfuscation performed by the [NebulaVM](https://github.com/x676w/nebula-vm) obfuscator.
+Reverses JavaScript obfuscation from [NebulaVM](https://github.com/x676w/nebula-vm).
 
-## Overview
+## What it does
 
-NebulaVM is a JavaScript obfuscator that converts code into custom bytecode executed by an embedded virtual machine interpreter. This tool analyzes obfuscated output and reconstructs readable JavaScript.
+NebulaVM compiles JavaScript into custom bytecode that runs on an embedded VM interpreter. This tool takes that obfuscated output and reconstructs readable JavaScript.
 
-## Features
-
-- **Automatic Opcode Detection** - Fingerprints shuffled opcodes through AST analysis
-- **Bytecode Disassembly** - Converts VM bytecode to intermediate representation
-- **Code Reconstruction** - Generates clean JavaScript from disassembled instructions
-- **Control Flow Recovery** - Reconstructs loops and conditionals using CFG analysis
-- **Compression Support** - Handles both compressed and uncompressed bytecode
+Supports both V1 (pre-Jan 21, 2026) and V2 (Jan 21, 2026+) formats. Version is detected automatically.
 
 ## Installation
 
@@ -23,92 +17,84 @@ npm install
 ## Usage
 
 ```bash
-# Basic deobfuscation (output to stdout)
-node src/index.js obfuscated.js
-
-# Save output to file
-node src/index.js obfuscated.js -o clean.js
-
-# Verbose mode with debug info
-node src/index.js obfuscated.js --verbose
-
-# Show disassembled bytecode
-node src/index.js obfuscated.js --disasm
-
-# Dump extracted strings
+node src/index.js obfuscated.js              # output to stdout
+node src/index.js obfuscated.js -o clean.js  # save to file
+node src/index.js obfuscated.js --verbose    # debug info
+node src/index.js obfuscated.js --disasm     # show disassembled bytecode
 node src/index.js obfuscated.js --dump-strings
-
-# Dump detected opcode mapping
 node src/index.js obfuscated.js --dump-opcodes
 ```
 
-## How It Works
+## How it works
 
-### NebulaVM Obfuscation
+NebulaVM obfuscation:
+1. Transpiles to ES5
+2. Compiles to custom bytecode
+3. Randomizes opcodes per build
+4. XORs (0x80) and Base64 encodes the bytecode
+5. Stores strings separately with XOR encoding
+6. Bundles an interpreter that executes it all at runtime
 
-1. JavaScript is transpiled to ES5
-2. Code is compiled into custom bytecode
-3. Opcodes are randomized per obfuscation
-4. Bytecode is XOR'd (0x80) and Base64 encoded
-5. Strings are stored separately with XOR encoding
-6. An interpreter executes the bytecode at runtime
+Deobfuscation:
+1. Parse the IIFE, extract the encoded bytecode and strings
+2. Decode (Base64, XOR, decompress if needed)
+3. Analyze the interpreter's switch handlers to figure out which opcode does what
+4. Disassemble the bytecode into an IR
+5. Rebuild JavaScript by emulating the stack symbolically
 
-### Deobfuscation Process
-
-1. **Extraction** - Parse the IIFE to extract encoded bytecode and strings
-2. **Decode** - Base64 decode, XOR, and optionally decompress
-3. **Map Opcodes** - Fingerprint interpreter handlers to identify opcodes
-4. **Disassemble** - Convert bytecode stream to instruction IR
-5. **Generate** - Rebuild JavaScript using symbolic stack execution
-
-## Project Structure
+## Project structure
 
 ```
 src/
-├── index.js                 # CLI entry point
+├── index.js                    # CLI
 ├── runtime/
-│   └── bytecodeReader.js    # Bytecode decoding utilities
+│   └── bytecodeReader.js       # decoding (Base64, XOR, LZ77/zlib)
 ├── analysis/
-│   └── interpreterAnalyzer.js # VM dispatcher analysis
+│   └── interpreterAnalyzer.js  # opcode fingerprinting
 ├── emission/
-│   ├── stackMachine.js      # Symbolic stack emulation
-│   ├── statementEmitter.js  # JavaScript generation
-│   └── controlFlowReconstructor.js # Loop/conditional recovery
+│   ├── stackMachine.js         # symbolic stack
+│   ├── statementEmitter.js     # JS generation
+│   └── controlFlowReconstructor.js
 └── lib/
-    ├── opcodes.js           # NebulaVM ISA definitions
-    ├── extractor.js         # Extraction facade
-    ├── disassembler.js      # Bytecode to IR
-    ├── codeGenerator.js     # Code generation orchestrator
-    └── cfg.js               # Control flow graph analysis
+    ├── opcodes.js              # opcode definitions
+    ├── extractor.js            # bytecode/string extraction
+    ├── disassembler.js         # bytecode → IR
+    ├── codeGenerator.js        # orchestrates code generation
+    └── cfg.js                  # control flow graph, dominators
 ```
 
 ## Limitations
 
-- Variable names cannot be recovered (uses generated names like `var_0`)
-- Comments and original formatting are lost
-- Complex nested control flow may use label-based fallback
-- Works best with standard NebulaVM output
+- Original variable names are gone; output uses `var_0`, `var_1`, etc.
+- Comments don't survive
+- Weird control flow sometimes falls back to labels/gotos
+- Only tested against standard NebulaVM output
+
+## V2 support
+
+V2 broke the deobfuscator when it came out. We updated it to handle:
+- LZ77 compression (V1 used zlib)
+- Compression flag moved to end of bytecode
+- New opcodes for try-catch and regex
+- Different operand formats
+- Changed loop compilation pattern
+
+See [V2_SUPPORT.md](V2_SUPPORT.md) for details.
 
 ## Changelog
 
-### 2026-01-04
+**2026-01-25**: V2 support. LZ77 decompression, new opcode fingerprints, fixed CFG post-dominator calculation, both V1 and V2 loop patterns now detected.
 
-- **Operand order randomization support** - NebulaVM randomizes not just opcodes but also operand order in binary operations (comparisons, arithmetic, bitwise). Added detection for the "temp-variable pattern" (`var n = pop(); push(pop() OP n)`) to identify swapped operand handlers, fixing incorrect expression reconstruction.
-- **Ternary expression support** - Added detection for NebulaVM's `ConditionalExpressionCompiler` pattern (`JUMP_IF_FALSE` + `JUMP`). The deobfuscator now reconstructs `a ? b : c` ternary expressions instead of converting them to if-else statements.
-- **Codebase optimization** - Removed unused classes, methods, parameters, and simplified internal control flow analysis.
+**2026-01-04**: Operand order randomization support (NebulaVM randomizes operand order in binary ops, not just opcodes). Ternary expression reconstruction. Cleaned up unused code.
 
 ## Disclaimer
 
-This tool is provided for **educational and security research purposes only**. 
-
-- Do not use this tool to circumvent software protections in violation of applicable laws
-- Do not redistribute deobfuscated code that you do not have rights to
-- Users are responsible for ensuring their use complies with all applicable laws and terms of service
+For research and education. Don't use it to bypass protections illegally or redistribute code you don't own.
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues and pull requests.
+Issues and PRs welcome.

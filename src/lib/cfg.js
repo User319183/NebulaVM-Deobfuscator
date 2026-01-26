@@ -68,6 +68,7 @@ export class ControlFlowGraph {
    * - First instruction (program entry point)
    * - Jump/branch targets (control transfer destinations)
    * - Instructions following jumps/returns (fallthrough after control transfer)
+   * - Conditional jump instructions (to isolate conditionals from preceding statements)
    *
    * Phase 2: Basic Block Partitioning
    * Group consecutive instructions between leaders into basic blocks.
@@ -93,6 +94,10 @@ export class ControlFlowGraph {
         }
         if (i + 1 < this.instructions.length) {
           leaders.add(i + 1);
+        }
+        // Also mark conditional jumps as leaders to isolate them from preceding statements
+        if (instr.opName === 'JUMP_IF_TRUE' || instr.opName === 'JUMP_IF_FALSE') {
+          leaders.add(i);
         }
       }
 
@@ -307,13 +312,16 @@ export class ControlFlowGraph {
         } else {
           const pdomIdPostDoms = postDominators.get(pdomId);
           const ipdomPostDoms = postDominators.get(ipdom);
-          // The immediate post-dominator is the one closest to the node
-          // Choose the post-dominator with the LARGER post-dominator set (closer to node)
+          // The immediate post-dominator is the one CLOSEST to the node (first reached)
+          // If ipdom is IN PostDom(pdomId), then ipdom post-dominates pdomId,
+          // meaning pdomId comes BEFORE ipdom (pdomId is closer). Switch to pdomId.
+          // If pdomId is IN PostDom(ipdom), then pdomId post-dominates ipdom,
+          // meaning ipdom comes BEFORE pdomId (ipdom is closer). Keep ipdom.
           if (pdomIdPostDoms && pdomIdPostDoms.has(ipdom)) {
-            // pdomId post-dominates ipdom, so ipdom is closer - keep ipdom
-          } else if (ipdomPostDoms && ipdomPostDoms.has(pdomId)) {
             // ipdom post-dominates pdomId, so pdomId is closer - switch to pdomId
             ipdom = pdomId;
+          } else if (ipdomPostDoms && ipdomPostDoms.has(pdomId)) {
+            // pdomId post-dominates ipdom, so ipdom is closer - keep ipdom
           }
         }
       }
@@ -334,42 +342,53 @@ export class ControlFlowGraph {
    *
    * This structural analysis enables reconstruction of high-level control
    * flow statements from the flat bytecode representation.
+   *
+   * Note: Processes conditionals from innermost to outermost to properly
+   * handle nested if-else structures.
    */
   detectStructuredRegions() {
     this.regions = [];
-    const processed = new Set();
 
-    for (const [blockId, block] of this.blocks) {
-      if (processed.has(blockId)) continue;
-
+    // Find all conditional blocks
+    const conditionalBlocks = [];
+    for (const [, block] of this.blocks) {
       if (block.isConditional && block.trueSuccessor && block.falseSuccessor) {
-        const ipdom = this.immediatePostDominators.get(blockId);
+        conditionalBlocks.push(block);
+      }
+    }
 
-        if (ipdom !== null && ipdom !== undefined) {
-          const mergeBlock = this.blocks.get(ipdom);
+    // Sort by end index descending (process innermost/later blocks first)
+    // This ensures nested conditionals are detected before their parents
+    conditionalBlocks.sort((a, b) => b.endIdx - a.endIdx);
 
-          const trueBlocks = this.collectBlocksUntil(block.trueSuccessor, mergeBlock, processed);
-          const falseBlocks = this.collectBlocksUntil(block.falseSuccessor, mergeBlock, processed);
+    for (const block of conditionalBlocks) {
+      const ipdom = this.immediatePostDominators.get(block.id);
 
-          if (trueBlocks.length > 0 || falseBlocks.length > 0) {
-            const region = {
-              type: 'if-else',
-              conditionBlock: block,
-              trueBlocks: trueBlocks,
-              falseBlocks: falseBlocks,
-              mergeBlock: mergeBlock,
-              startIdx: block.startIdx,
-              endIdx: mergeBlock ? mergeBlock.startIdx : block.endIdx
-            };
+      if (ipdom !== null && ipdom !== undefined) {
+        const mergeBlock = this.blocks.get(ipdom);
 
-            this.regions.push(region);
-            processed.add(blockId);
-            for (const b of trueBlocks) processed.add(b.id);
-            for (const b of falseBlocks) processed.add(b.id);
-          }
+        // Don't exclude any blocks - allow nested regions
+        const trueBlocks = this.collectBlocksUntil(block.trueSuccessor, mergeBlock, new Set());
+        const falseBlocks = this.collectBlocksUntil(block.falseSuccessor, mergeBlock, new Set());
+
+        if (trueBlocks.length > 0 || falseBlocks.length > 0) {
+          const region = {
+            type: 'if-else',
+            conditionBlock: block,
+            trueBlocks: trueBlocks,
+            falseBlocks: falseBlocks,
+            mergeBlock: mergeBlock,
+            startIdx: block.startIdx,
+            endIdx: mergeBlock ? mergeBlock.startIdx : block.endIdx
+          };
+
+          this.regions.push(region);
         }
       }
     }
+
+    // Sort regions by start index for consistent processing order
+    this.regions.sort((a, b) => a.startIdx - b.startIdx);
 
     return this;
   }

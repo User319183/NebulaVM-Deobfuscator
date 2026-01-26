@@ -35,14 +35,23 @@ export class ControlFlowReconstructor {
 
   /**
    * Detect while loops by identifying backward jump patterns
-   * A while loop pattern consists of:
+   * 
+   * V1 Pattern (post-test):
    * 1. Initial JUMP to condition (skips loop body on first iteration)
    * 2. Loop body (basic block sequence)
    * 3. Condition evaluation followed by conditional back-jump
+   *
+   * V2 Pattern (pre-test):
+   * 1. Condition evaluation
+   * 2. JUMP_IF_FALSE to exit (or JUMP_IF_TRUE to body)
+   * 3. Loop body
+   * 4. Unconditional JUMP back to condition
    */
   detectLoops() {
     const loops = [];
+    const usedInstructions = new Set();
 
+    // V1 Pattern: JUMP → body → condition → JUMP_IF_* (back)
     for (let i = 0; i < this.instructions.length; i++) {
       const instr = this.instructions[i];
 
@@ -59,6 +68,7 @@ export class ControlFlowReconstructor {
               if (backIdx !== undefined && backIdx <= i + 1) {
                 loops.push({
                   type: 'while',
+                  pattern: 'v1',
                   initJumpIdx: i,
                   bodyStartIdx: i + 1,
                   condStartIdx: targetIdx,
@@ -66,10 +76,56 @@ export class ControlFlowReconstructor {
                   condJumpIdx: j,
                   isTrue: checkInstr.opName === 'JUMP_IF_TRUE'
                 });
+                usedInstructions.add(i);
+                usedInstructions.add(j);
                 break;
               }
             }
             if (checkInstr.opName === 'JUMP') break;
+          }
+        }
+      }
+    }
+
+    // V2 Pattern: condition → JUMP_IF_FALSE (exit) → body → JUMP (back to condition)
+    for (let i = 0; i < this.instructions.length; i++) {
+      const instr = this.instructions[i];
+      if (usedInstructions.has(i)) continue;
+
+      if (instr.opName === 'JUMP_IF_FALSE' || instr.opName === 'JUMP_IF_TRUE') {
+        const exitAddr = instr.args[0]?.value;
+        const exitIdx = this.addrToIdx.get(exitAddr);
+
+        if (exitIdx !== undefined && exitIdx > i) {
+          // Look for a JUMP back to condition within the body
+          for (let j = i + 1; j < exitIdx; j++) {
+            const bodyInstr = this.instructions[j];
+            if (bodyInstr.opName === 'JUMP') {
+              const backAddr = bodyInstr.args[0]?.value;
+              const backIdx = this.addrToIdx.get(backAddr);
+
+              // Must be the last instruction before exit and jump back before condition start
+              if (backIdx !== undefined && backIdx <= i && j === exitIdx - 1) {
+                // Find the condition start by looking backward from the conditional jump
+                let condStartIdx = backIdx;
+                // Validate this is a loop structure
+                loops.push({
+                  type: 'while',
+                  pattern: 'v2',
+                  condStartIdx: condStartIdx,
+                  condEndIdx: i,
+                  condJumpIdx: i,
+                  bodyStartIdx: i + 1,
+                  bodyEndIdx: j - 1,
+                  backJumpIdx: j,
+                  exitIdx: exitIdx,
+                  isTrue: instr.opName === 'JUMP_IF_TRUE'
+                });
+                usedInstructions.add(i);
+                usedInstructions.add(j);
+                break;
+              }
+            }
           }
         }
       }
@@ -94,14 +150,27 @@ export class ControlFlowReconstructor {
   /**
    * Build a map of structured regions indexed by condition instruction index
    * This allows quick lookup when processing instructions
+   * @param {ControlFlowGraph} cfg - The control flow graph
+   * @param {Array} loops - Optional array of detected loops to exclude from regions
    */
-  buildRegionMap(cfg) {
+  buildRegionMap(cfg, loops = []) {
     const regionsByCondIdx = new Map();
+
+    // Build set of loop-related instruction indices to exclude
+    const loopCondJumps = new Set();
+    for (const loop of loops) {
+      if (loop.condJumpIdx !== undefined) {
+        loopCondJumps.add(loop.condJumpIdx);
+      }
+    }
 
     for (const region of cfg.regions) {
       if (region.type === 'if-else' && region.conditionBlock) {
         const condBlock = region.conditionBlock;
         const condJumpIdx = condBlock.endIdx;
+
+        if (loopCondJumps.has(condJumpIdx)) continue;
+
         regionsByCondIdx.set(condJumpIdx, region);
       }
     }
@@ -182,26 +251,124 @@ export class ControlFlowReconstructor {
   }
 
   /**
+   * Detect short-circuit logical operator patterns (&&, ||)
+   *
+   * Pattern from NebulaVM:
+   * - [left operand expression]
+   * - STACK_PUSH_DUPLICATE
+   * - JUMP_IF_FALSE -> target (for &&) or JUMP_IF_TRUE -> target (for ||)
+   * - STACK_POP
+   * - [right operand expression]
+   * - target: [continues with result on stack]
+   *
+   * Key characteristics:
+   * - Uses DUPLICATE to preserve left operand before conditional jump
+   * - No explicit "else" branch - just continues to target if short-circuited
+   * - STACK_POP discards duplicate when continuing to right operand
+   */
+  detectLogicalOperators() {
+    const logicals = new Map();
+
+    // Statement-level ops that should not appear in a pure expression
+    const statementOps = new Set([
+      'STORE_VARIABLE', 'SET_PROPERTY', 'UNARY_THROW', 'RETURN', 'DEBUGGER',
+      'JUMP', 'JUMP_IF_TRUE', 'JUMP_IF_FALSE', 'TRY_PUSH', 'TRY_POP'
+    ]);
+
+    for (let i = 0; i < this.instructions.length; i++) {
+      const instr = this.instructions[i];
+
+      if (instr.opName !== 'JUMP_IF_FALSE' && instr.opName !== 'JUMP_IF_TRUE') continue;
+
+      const prevInstr = i > 0 ? this.instructions[i - 1] : null;
+      if (!prevInstr || prevInstr.opName !== 'STACK_PUSH_DUPLICATE') continue;
+
+      const nextInstr = i + 1 < this.instructions.length ? this.instructions[i + 1] : null;
+      if (!nextInstr || nextInstr.opName !== 'STACK_POP') continue;
+
+      const targetAddr = instr.args[0]?.value;
+      const targetIdx = this.addrToIdx.get(targetAddr);
+
+      if (targetIdx === undefined || targetIdx <= i + 1) continue;
+
+      // Validate right operand is a pure expression sequence (no jumps/statements)
+      let isPureExpression = true;
+      for (let j = i + 2; j < targetIdx; j++) {
+        const rightInstr = this.instructions[j];
+        if (statementOps.has(rightInstr.opName)) {
+          isPureExpression = false;
+          break;
+        }
+      }
+
+      if (!isPureExpression) continue;
+
+      const operator = instr.opName === 'JUMP_IF_FALSE' ? '&&' : '||';
+
+      logicals.set(i, {
+        operator,
+        duplicateIdx: i - 1,
+        jumpIdx: i,
+        popIdx: i + 1,
+        rightStartIdx: i + 2,
+        rightEndIdx: targetIdx - 1,
+        targetIdx
+      });
+    }
+
+    return logicals;
+  }
+
+  /**
    * Build maps for quick loop lookup by instruction index
    */
   buildLoopMaps(loops) {
     const loopsByInitJump = new Map();
     const loopsByCondJump = new Map();
+    const loopsByCondStart = new Map();
 
     for (const loop of loops) {
-      loopsByInitJump.set(loop.initJumpIdx, loop);
+      if (loop.pattern === 'v1' && loop.initJumpIdx !== undefined) {
+        loopsByInitJump.set(loop.initJumpIdx, loop);
+      }
+      if (loop.pattern === 'v2' && loop.condStartIdx !== undefined) {
+        loopsByCondStart.set(loop.condStartIdx, loop);
+      }
       loopsByCondJump.set(loop.condJumpIdx, loop);
     }
 
-    return { loopsByInitJump, loopsByCondJump };
+    return { loopsByInitJump, loopsByCondJump, loopsByCondStart };
   }
 
   /**
    * Determine which jump targets need labels (unstructured jumps)
-   * Structured control flow (loops, if-else) doesn't need labels
+   * Structured control flow (loops, if-else, logicals) doesn't need labels
    */
-  findUsedLabels(loops, regionsByCondIdx) {
+  findUsedLabels(loops, regionsByCondIdx, logicals = null) {
     const usedLabels = new Set();
+    const logicalJumps = logicals || new Map();
+
+    // Build set of loop-related jump targets
+    const loopJumpTargets = new Set();
+    for (const loop of loops) {
+      if (loop.condJumpIdx !== undefined) {
+        const target = this.instructions[loop.condJumpIdx]?.args[0]?.value;
+        if (target !== undefined) loopJumpTargets.add(target);
+      }
+      if (loop.initJumpIdx !== undefined) {
+        const target = this.instructions[loop.initJumpIdx]?.args[0]?.value;
+        if (target !== undefined) loopJumpTargets.add(target);
+      }
+      if (loop.backJumpIdx !== undefined) {
+        const target = this.instructions[loop.backJumpIdx]?.args[0]?.value;
+        if (target !== undefined) loopJumpTargets.add(target);
+      }
+      // Add the exit target for V2 loops
+      if (loop.exitIdx !== undefined) {
+        const exitAddr = this.instructions[loop.exitIdx]?.addr;
+        if (exitAddr !== undefined) loopJumpTargets.add(exitAddr);
+      }
+    }
 
     for (const instr of this.instructions) {
       if (['JUMP', 'JUMP_IF_TRUE', 'JUMP_IF_FALSE'].includes(instr.opName)) {
@@ -209,11 +376,9 @@ export class ControlFlowReconstructor {
         const instrIdx = this.instructions.indexOf(instr);
 
         if (targetAddr !== undefined &&
-            !loops.some(l =>
-              this.instructions[l.condJumpIdx]?.args[0]?.value === targetAddr ||
-              this.instructions[l.initJumpIdx]?.args[0]?.value === targetAddr
-            ) &&
-            !regionsByCondIdx.has(instrIdx)) {
+            !loopJumpTargets.has(targetAddr) &&
+            !regionsByCondIdx.has(instrIdx) &&
+            !logicalJumps.has(instrIdx)) {
           usedLabels.add(targetAddr);
         }
       }

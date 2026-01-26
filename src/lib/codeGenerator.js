@@ -31,6 +31,58 @@ export class CodeGenerator {
     this.stackMachine = new StackMachine(strings, this.getVarName.bind(this));
     this.emitter = new StatementEmitter(this);
     this.cfReconstructor = new ControlFlowReconstructor(instructions);
+    this.tryRegions = this.analyzeTryRegions();
+  }
+
+  analyzeTryRegions() {
+    const regions = [];
+    const tryStack = [];
+
+    for (let i = 0; i < this.instructions.length; i++) {
+      const instr = this.instructions[i];
+      if (instr.opName === 'TRY_PUSH') {
+        const catchAddr = instr.args[0]?.value;
+        tryStack.push({
+          tryStartIdx: i,
+          catchAddr,
+          catchAddrIdx: null,
+          tryEndIdx: null,
+          catchEndIdx: null
+        });
+      } else if (instr.opName === 'TRY_POP' && tryStack.length > 0) {
+        const region = tryStack.pop(); // Pop the completed region
+        region.tryEndIdx = i;
+        // Find the JUMP that skips catch block (usually right after TRY_POP)
+        const nextInstr = this.instructions[i + 1];
+        if (nextInstr?.opName === 'JUMP') {
+          region.afterTryCatchAddr = nextInstr.args[0]?.value;
+        }
+        regions.push(region); // Move to completed regions immediately
+      }
+    }
+
+    // Find instruction indices for catch addresses
+    for (const region of regions) {
+      if (region.catchAddr != null) {
+        for (let i = 0; i < this.instructions.length; i++) {
+          if (this.instructions[i].addr === region.catchAddr) {
+            region.catchAddrIdx = i;
+            break;
+          }
+        }
+        // Find catch block end (JUMP to afterTryCatch)
+        if (region.catchAddrIdx != null && region.afterTryCatchAddr != null) {
+          for (let i = region.catchAddrIdx; i < this.instructions.length; i++) {
+            const instr = this.instructions[i];
+            if (instr.opName === 'JUMP' && instr.args[0]?.value === region.afterTryCatchAddr) {
+              region.catchEndIdx = i;
+              break;
+            }
+          }
+        }
+      }
+    }
+    return regions;
   }
 
   getVarName(scopeId, varId) {
@@ -52,6 +104,16 @@ export class CodeGenerator {
     return this.scopeVarNames.get(key);
   }
 
+  cleanStringValue(value) {
+    if (typeof value !== 'string') return '';
+    // Remove surrounding quotes if present
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      return value.slice(1, -1);
+    }
+    return value;
+  }
+
   generateLabel(addr) {
     if (!this.addressToLabel.has(addr)) {
       this.addressToLabel.set(addr, `label_${addr}`);
@@ -71,11 +133,32 @@ export class CodeGenerator {
     const { loops } = this.analyzeControlFlow();
 
     const cfg = this.cfReconstructor.buildCFGRegions();
-    const regionsByCondIdx = this.cfReconstructor.buildRegionMap(cfg);
-    const { loopsByInitJump, loopsByCondJump } = this.cfReconstructor.buildLoopMaps(loops);
+    const { loopsByInitJump, loopsByCondJump, loopsByCondStart } = this.cfReconstructor.buildLoopMaps(loops);
+    const regionsByCondIdx = this.cfReconstructor.buildRegionMap(cfg, loops);
     const ternaries = this.cfReconstructor.detectTernaryExpressions(regionsByCondIdx);
+    const logicals = this.cfReconstructor.detectLogicalOperators();
 
-    this.usedLabels = this.cfReconstructor.findUsedLabels(loops, regionsByCondIdx);
+    this.usedLabels = this.cfReconstructor.findUsedLabels(loops, regionsByCondIdx, logicals);
+
+    // Build maps for try-catch regions
+    const catchBlockStarts = new Map();
+    const catchBlockEnds = new Set();
+    const skipJumpsAfterTry = new Set();
+    for (const region of this.tryRegions) {
+      if (region.catchAddrIdx != null) {
+        catchBlockStarts.set(region.catchAddrIdx, region);
+      }
+      if (region.catchEndIdx != null) {
+        catchBlockEnds.add(region.catchEndIdx);
+      }
+      // The JUMP after TRY_POP should be skipped
+      if (region.tryEndIdx != null) {
+        const jumpIdx = region.tryEndIdx + 1;
+        if (this.instructions[jumpIdx]?.opName === 'JUMP') {
+          skipJumpsAfterTry.add(jumpIdx);
+        }
+      }
+    }
 
     const stack = [];
     let i = 0;
@@ -86,6 +169,33 @@ export class CodeGenerator {
     while (i < this.instructions.length) {
       const instr = this.instructions[i];
       const nextInstr = this.instructions[i + 1];
+
+      // Check if we're at catch block start
+      if (catchBlockStarts.has(i)) {
+        const region = catchBlockStarts.get(i);
+        // End the try block properly and start catch
+        this.indent--;
+        this.emitter.emit('} catch (err) {');
+        this.indent++;
+        // The first instruction of catch block is STORE_VARIABLE for the error
+        // Push 'err' onto the stack so STORE_VARIABLE uses it
+        stack.push('err');
+      }
+
+      // Check if we should skip this JUMP (it's the try-to-catch skip)
+      if (skipJumpsAfterTry.has(i)) {
+        i++;
+        continue;
+      }
+
+      // Check if we're at catch block end
+      if (catchBlockEnds.has(i)) {
+        // This is the final JUMP of catch block, emit closing brace
+        this.indent--;
+        this.emitter.emit('}');
+        i++;
+        continue;
+      }
 
       if (loopsByInitJump.has(i)) {
         const loop = loopsByInitJump.get(i);
@@ -140,16 +250,97 @@ export class CodeGenerator {
         continue;
       }
 
+      // Handle V2 pattern loops (condition-first)
+      if (loopsByCondStart.has(i)) {
+        const loop = loopsByCondStart.get(i);
+
+        // Evaluate condition
+        const condStack = [];
+        for (let c = loop.condStartIdx; c <= loop.condEndIdx; c++) {
+          const condInstr = this.instructions[c];
+          if (condInstr.opName !== 'JUMP_IF_TRUE' && condInstr.opName !== 'JUMP_IF_FALSE') {
+            this.processInstruction(condInstr, condStack);
+          }
+        }
+        let condition = condStack.pop() || 'true';
+        // V2 uses JUMP_IF_FALSE to exit, so we need to keep condition as-is (it's already correct)
+        if (!loop.isTrue) {
+          // JUMP_IF_FALSE: loop while condition is true (condition exits when false)
+          // condition is already correct
+        } else {
+          // JUMP_IF_TRUE: loop while condition is false (negate)
+          condition = `!(${condition})`;
+        }
+
+        this.emitter.emitWhileStart(condition);
+
+        const loopStack = this.stackMachine.clone(stack);
+        for (let b = loop.bodyStartIdx; b <= loop.bodyEndIdx; b++) {
+          const bodyInstr = this.instructions[b];
+          const bodyNextInstr = this.instructions[b + 1];
+
+          try {
+            this.processInstruction(bodyInstr, loopStack);
+          } catch (e) {
+            this.emitter.emitError(`Error: ${e.message}`);
+          }
+
+          if (callOps.has(bodyInstr.opName) && loopStack.length > 0) {
+            if (!bodyNextInstr || !consumeOps.has(bodyNextInstr.opName) || b + 1 > loop.bodyEndIdx) {
+              const callResult = loopStack.pop();
+              if (this.emitter.shouldEmitCallResult(callResult)) {
+                this.emitter.emitExpression(callResult);
+              }
+            }
+          }
+        }
+
+        for (let s = 0; s < loopStack.length; s++) {
+          const expr = loopStack[s];
+          if (expr && !this.stackMachine.isTrivialValue(expr)) {
+            this.emitter.emitExpression(expr);
+          }
+        }
+
+        this.emitter.emitWhileEnd();
+
+        // Skip to exit point (after the loop)
+        i = loop.exitIdx;
+        continue;
+      }
+
+      // Handle short-circuit logical operators (&&, ||)
+      if (logicals.has(i)) {
+        const logical = logicals.get(i);
+        // Stack has [left, left] due to DUPLICATE - pop one copy for the check
+        stack.pop();
+        const left = stack.pop() || 'true';
+
+        // Clone current stack for right operand evaluation (preserves any prior context)
+        const rightStack = this.stackMachine.clone(stack);
+        for (let j = logical.rightStartIdx; j <= logical.rightEndIdx; j++) {
+          this.processInstruction(this.instructions[j], rightStack, callOps, consumeOps, true);
+        }
+        const right = rightStack.pop() || 'undefined';
+
+        // Build logical expression
+        stack.push(`(${left} ${logical.operator} ${right})`);
+
+        // Skip to target instruction
+        i = logical.targetIdx;
+        continue;
+      }
+
       if (ternaries.has(i)) {
         const ternary = ternaries.get(i);
         const condition = stack.pop() || 'true';
 
         const trueStack = this.stackMachine.clone(stack);
-        this.processBlockSequence(ternary.trueBlocks, trueStack, callOps, consumeOps, true);
+        this.processBlockSequence(ternary.trueBlocks, trueStack, callOps, consumeOps, true, regionsByCondIdx, ternaries, logicals);
         const consequent = trueStack.pop() || 'undefined';
 
         const falseStack = this.stackMachine.clone(stack);
-        this.processBlockSequence(ternary.falseBlocks, falseStack, callOps, consumeOps, true);
+        this.processBlockSequence(ternary.falseBlocks, falseStack, callOps, consumeOps, true, regionsByCondIdx, ternaries, logicals);
         const alternate = falseStack.pop() || 'undefined';
 
         stack.push(`(${condition} ? ${consequent} : ${alternate})`);
@@ -174,7 +365,7 @@ export class CodeGenerator {
 
           if (hasTrueBody) {
             const trueStack = this.stackMachine.clone(stack);
-            this.processBlockSequence(region.trueBlocks, trueStack, callOps, consumeOps);
+            this.processBlockSequence(region.trueBlocks, trueStack, callOps, consumeOps, false, regionsByCondIdx, ternaries, logicals);
             this.emitRemainingStack(trueStack, stack.length);
           }
 
@@ -185,7 +376,7 @@ export class CodeGenerator {
             this.indent++;
 
             const falseStack = this.stackMachine.clone(stack);
-            this.processBlockSequence(region.falseBlocks, falseStack, callOps, consumeOps);
+            this.processBlockSequence(region.falseBlocks, falseStack, callOps, consumeOps, false, regionsByCondIdx, ternaries, logicals);
             this.emitRemainingStack(falseStack, stack.length);
 
             this.indent--;
@@ -213,7 +404,9 @@ export class CodeGenerator {
       }
 
       if (callOps.has(instr.opName) && stack.length > 0) {
-        if (nextInstr && !consumeOps.has(nextInstr.opName)) {
+        // Emit call result if it won't be consumed by the next instruction
+        // consumeOps are operations that use values from the stack
+        if (!nextInstr || !consumeOps.has(nextInstr.opName)) {
           const callResult = stack.pop();
           if (this.emitter.shouldEmitCallResult(callResult)) {
             this.emitter.emitExpression(callResult);
@@ -238,11 +431,109 @@ export class CodeGenerator {
     return this.output.join('\n');
   }
 
-  processBlockSequence(blocks, blockStack, callOps, consumeOps, isTernary = false) {
+  processBlockSequence(blocks, blockStack, callOps, consumeOps, isTernary = false, regionsByCondIdx = null, ternaries = null, logicals = null) {
+    // Build set of instruction indices in this block sequence
+    const blockInstrIndices = new Set();
     for (const block of blocks) {
-      for (let b = 0; b < block.instructions.length; b++) {
-        const blockInstr = block.instructions[b];
-        if (blockInstr.opName === 'JUMP' && b === block.instructions.length - 1) continue;
+      for (let i = block.startIdx; i <= block.endIdx; i++) {
+        blockInstrIndices.add(i);
+      }
+    }
+
+    // Process blocks in order
+    let skipUntil = -1;
+    for (const block of blocks) {
+      for (let b = block.startIdx; b <= block.endIdx; b++) {
+        if (b < skipUntil) continue;
+
+        const blockInstr = this.instructions[b];
+        if (!blockInstr) continue;
+        if (blockInstr.opName === 'JUMP' && b === block.endIdx) continue;
+
+        // Check for ternaries FIRST (more specific pattern than if-else)
+        if (ternaries && ternaries.has(b)) {
+          const ternary = ternaries.get(b);
+          const condition = blockStack.pop() || 'true';
+
+          const trueStack = this.stackMachine.clone(blockStack);
+          this.processBlockSequence(ternary.trueBlocks, trueStack, callOps, consumeOps, true, regionsByCondIdx, ternaries, logicals);
+          const consequent = trueStack.pop() || 'undefined';
+
+          const falseStack = this.stackMachine.clone(blockStack);
+          this.processBlockSequence(ternary.falseBlocks, falseStack, callOps, consumeOps, true, regionsByCondIdx, ternaries, logicals);
+          const alternate = falseStack.pop() || 'undefined';
+
+          blockStack.push(`(${condition} ? ${consequent} : ${alternate})`);
+
+          if (ternary.mergeBlock) {
+            skipUntil = ternary.mergeBlock.startIdx;
+          } else {
+            skipUntil = ternary.endIdx;
+          }
+          continue;
+        }
+
+        // Check for logical operators
+        if (logicals && logicals.has(b)) {
+          const logical = logicals.get(b);
+          blockStack.pop();
+          const left = blockStack.pop() || 'true';
+
+          const rightStack = this.stackMachine.clone(blockStack);
+          for (let j = logical.rightStartIdx; j <= logical.rightEndIdx; j++) {
+            this.processInstruction(this.instructions[j], rightStack, callOps, consumeOps, true);
+          }
+          const right = rightStack.pop() || 'undefined';
+
+          blockStack.push(`(${left} ${logical.operator} ${right})`);
+          skipUntil = logical.targetIdx;
+          continue;
+        }
+
+        // Check for nested if-else regions (after ternaries and logicals)
+        if (regionsByCondIdx && regionsByCondIdx.has(b)) {
+          const region = regionsByCondIdx.get(b);
+          // Skip if this is actually a ternary (already handled above)
+          if (ternaries && ternaries.has(b)) {
+            continue;
+          }
+
+          const condition = blockStack.pop() || 'true';
+          const hasTrueBody = region.trueBlocks && region.trueBlocks.length > 0;
+          const hasFalseBody = region.falseBlocks && region.falseBlocks.length > 0;
+
+          if (hasTrueBody || hasFalseBody) {
+            this.emitter.emitIfStart(condition);
+
+            if (hasTrueBody) {
+              const trueStack = this.stackMachine.clone(blockStack);
+              this.processBlockSequence(region.trueBlocks, trueStack, callOps, consumeOps, false, regionsByCondIdx, ternaries, logicals);
+              this.emitRemainingStack(trueStack, blockStack.length);
+            }
+
+            this.indent--;
+
+            if (hasFalseBody) {
+              this.emitter.emit('} else {');
+              this.indent++;
+
+              const falseStack = this.stackMachine.clone(blockStack);
+              this.processBlockSequence(region.falseBlocks, falseStack, callOps, consumeOps, false, regionsByCondIdx, ternaries, logicals);
+              this.emitRemainingStack(falseStack, blockStack.length);
+
+              this.indent--;
+            }
+
+            this.emitter.emit('}');
+
+            if (region.mergeBlock) {
+              skipUntil = region.mergeBlock.startIdx;
+            } else {
+              skipUntil = region.endIdx;
+            }
+            continue;
+          }
+        }
 
         try {
           this.processInstruction(blockInstr, blockStack);
@@ -251,7 +542,7 @@ export class CodeGenerator {
         }
 
         if (!isTernary && callOps.has(blockInstr.opName) && blockStack.length > 0) {
-          const nextBlockInstr = block.instructions[b + 1];
+          const nextBlockInstr = this.instructions[b + 1];
           if (!nextBlockInstr || !consumeOps.has(nextBlockInstr.opName)) {
             const result = blockStack.pop();
             if (this.emitter.shouldEmitCallResult(result)) {
@@ -574,6 +865,51 @@ export class CodeGenerator {
 
       case 'DEBUGGER':
         this.emitter.emitDebugger();
+        break;
+
+      case 'BUILD_REGEXP': {
+        // V2: pattern and flags come from stack
+        // V1: pattern and flags come from instruction properties
+        let pattern, flags;
+        if (instr.args[0]?.type === 'has_flags') {
+          // V2 format: pop from stack
+          const hasFlags = instr.args[0].value;
+          flags = hasFlags ? this.cleanStringValue(stack.pop()) : '';
+          pattern = this.cleanStringValue(stack.pop());
+        } else {
+          // V1 format: from instruction properties
+          pattern = instr.patternValue || '';
+          flags = instr.flagsValue || '';
+        }
+        // Escape forward slashes in pattern
+        pattern = pattern.replace(/\//g, '\\/');
+        stack.push(`/${pattern}/${flags}`);
+        break;
+      }
+
+      case 'TRY_PUSH': {
+        const catchAddr = instr.args[0]?.value;
+        const finallyAddr = instr.args[1]?.value;
+        this.emitter.emitTryStart();
+        break;
+      }
+
+      case 'TRY_POP':
+        break;
+
+      case 'TRY_CATCH': {
+        const scopeId = instr.args[0]?.value;
+        const varSlot = instr.args[1]?.value;
+        const errVarName = this.getVarName(scopeId, varSlot);
+        this.emitter.emitCatchStart(errVarName);
+        break;
+      }
+
+      case 'TRY_FINALLY':
+        this.emitter.emitFinallyStart();
+        break;
+
+      case 'SEQUENCE_POP':
         break;
 
       default:

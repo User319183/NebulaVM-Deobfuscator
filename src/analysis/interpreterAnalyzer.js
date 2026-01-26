@@ -419,6 +419,8 @@ export function findVMStateProperties(ast) {
       doubleBracketAccess: false,
       directAccess: false,
       lengthAccess: false,
+      directCallBracketAccess: false,
+      variableBracketAccess: false,
     };
   }
 
@@ -524,6 +526,13 @@ export function findVMStateProperties(ast) {
           if (parent.computed) {
             propUsage[propName].singleBracketAccess = true;
 
+            const bracketProp = parent.property;
+            if (t.isCallExpression(bracketProp)) {
+              propUsage[propName].directCallBracketAccess = true;
+            } else if (t.isIdentifier(bracketProp)) {
+              propUsage[propName].variableBracketAccess = true;
+            }
+
             const grandParent = path.parentPath?.parent;
             if (t.isMemberExpression(grandParent) && grandParent.computed) {
               propUsage[propName].doubleBracketAccess = true;
@@ -560,11 +569,16 @@ export function findVMStateProperties(ast) {
   for (const [prop, usage] of Object.entries(propUsage)) {
     if (prop === vmState.stack || prop === vmState.global || prop === vmState.scopes) continue;
 
-    if (usage.singleBracketAccess && !usage.doubleBracketAccess && !vmState.stringTable) {
-      const lowerProp = prop.toLowerCase();
-      if (lowerProp !== 'a' && !lowerProp.includes('arg')) {
-        vmState.stringTable = prop;
-      }
+    if (usage.directCallBracketAccess && !usage.doubleBracketAccess && !vmState.stringTable) {
+      vmState.stringTable = prop;
+    }
+  }
+
+  for (const [prop, usage] of Object.entries(propUsage)) {
+    if (prop === vmState.stack || prop === vmState.global || prop === vmState.scopes || prop === vmState.stringTable) continue;
+
+    if (usage.variableBracketAccess && !usage.doubleBracketAccess && !vmState.arguments) {
+      vmState.arguments = prop;
     }
   }
 
@@ -614,6 +628,8 @@ function extractHandlerFeatures(funcNode, helpers, vmState) {
   const features = {
     pushCount: 0,
     popCount: 0,
+    helperPushCount: 0,
+    helperPopCount: 0,
     readsFromStringTable: false,
     readsIndex: false,
     readsDword: false,
@@ -644,12 +660,21 @@ function extractHandlerFeatures(funcNode, helpers, vmState) {
     hasTryFinally: false,
     hasThrow: false,
     hasDebugger: false,
+    hasRegExpCall: false,
     bodyStmtCount: 0,
     memberAccesses: new Set(),
     calledFunctions: new Set(),
     hasArrayFrom: false,
     hasNestedComputedAccess: false,
     hasDoubleNestedAccess: false,
+    hasDirectReadDwordInBracket: false,
+    hasVariableReadDwordInBracket: false,
+    hasNewRegExp: false,
+    hasTryStackPush: false,
+    hasTryStackPop: false,
+    accessesStackLast: false,
+    hasUnaryMinus: false,
+    hasUnaryPlus: false,
   };
 
   if (!funcNode.body || !funcNode.body.body) return features;
@@ -676,8 +701,14 @@ function extractHandlerFeatures(funcNode, helpers, vmState) {
         const name = callee.name;
         features.calledFunctions.add(name);
 
-        if (name === helperPush) features.pushCount++;
-        if (name === helperPop) features.popCount++;
+        if (name === helperPush) {
+          features.pushCount++;
+          features.helperPushCount++;
+        }
+        if (name === helperPop) {
+          features.popCount++;
+          features.helperPopCount++;
+        }
         if (name === helperReadDword) {
           features.readsIndex = true;
           features.readsDword = true;
@@ -689,15 +720,26 @@ function extractHandlerFeatures(funcNode, helpers, vmState) {
 
       if (t.isMemberExpression(callee)) {
         const propName = t.isIdentifier(callee.property) ? callee.property.name : null;
+        const calleeObj = callee.object;
 
-        if (propName === 'push') features.pushCount++;
-        if (propName === 'pop') features.popCount++;
+        if (propName === 'push') {
+          features.pushCount++;
+          if (t.isMemberExpression(calleeObj)) {
+            features.hasTryStackPush = true;
+          }
+        }
+        if (propName === 'pop') {
+          features.popCount++;
+          if (t.isMemberExpression(calleeObj)) {
+            features.hasTryStackPop = true;
+          }
+        }
         if (propName === 'apply') features.callsApply = true;
-        if (propName === 'get' && t.isIdentifier(callee.object) && callee.object.name === 'Reflect') {
+        if (propName === 'get' && t.isIdentifier(calleeObj) && calleeObj.name === 'Reflect') {
           features.usesReflectGet = true;
           features.accessesGlobal = true;
         }
-        if (propName === 'from' && t.isIdentifier(callee.object) && callee.object.name === 'Array') {
+        if (propName === 'from' && t.isIdentifier(calleeObj) && calleeObj.name === 'Array') {
           features.hasArrayFrom = true;
         }
       }
@@ -731,6 +773,23 @@ function extractHandlerFeatures(funcNode, helpers, vmState) {
 
       if (path.node.computed) {
         features.hasNestedComputedAccess = true;
+
+        // Detect stack[stack.length - 1] pattern for STACK_PUSH_DUPLICATE
+        const vmStack = vmState?.stack;
+        if (vmStack && t.isMemberExpression(obj) && !obj.computed) {
+          if (t.isIdentifier(obj.property) && obj.property.name === vmStack) {
+            const index = path.node.property;
+            if (t.isBinaryExpression(index) && index.operator === '-') {
+              const left = index.left;
+              const right = index.right;
+              if (t.isNumericLiteral(right) && right.value === 1 &&
+                  t.isMemberExpression(left) && !left.computed &&
+                  t.isIdentifier(left.property) && left.property.name === 'length') {
+                features.accessesStackLast = true;
+              }
+            }
+          }
+        }
 
         if (t.isMemberExpression(obj)) {
           features.hasDoubleNestedAccess = true;
@@ -766,6 +825,16 @@ function extractHandlerFeatures(funcNode, helpers, vmState) {
               }
             }
           }
+          
+          const prop = path.node.property;
+          if (t.isCallExpression(prop)) {
+            const callee = prop.callee;
+            if (t.isIdentifier(callee) && (callee.name === helperReadDword || features.calledFunctions.has(callee.name))) {
+              features.hasDirectReadDwordInBracket = true;
+            }
+          } else if (t.isIdentifier(prop)) {
+            features.hasVariableReadDwordInBracket = true;
+          }
         }
       }
     },
@@ -789,6 +858,12 @@ function extractHandlerFeatures(funcNode, helpers, vmState) {
 
     UnaryExpression(path) {
       features.operators.add(path.node.operator);
+      if (path.node.operator === '-') {
+        features.hasUnaryMinus = true;
+      }
+      if (path.node.operator === '+') {
+        features.hasUnaryPlus = true;
+      }
       if (path.node.operator === 'void' && t.isNumericLiteral(path.node.argument) && path.node.argument.value === 0) {
         features.pushesUndefined = true;
       }
@@ -808,11 +883,16 @@ function extractHandlerFeatures(funcNode, helpers, vmState) {
 
     NewExpression(path) {
       features.callsNew = true;
-      if (t.isIdentifier(path.node.callee) && path.node.callee.name === 'Array') {
+      const calleeName = t.isIdentifier(path.node.callee) ? path.node.callee.name : null;
+      if (calleeName === 'Array') {
         features.hasArrayLiteral = true;
       }
-      if (t.isIdentifier(path.node.callee) && path.node.callee.name === 'Float64Array') {
+      if (calleeName === 'Float64Array') {
         features.pushesFloat64 = true;
+      }
+      if (calleeName === 'RegExp') {
+        features.hasNewRegExp = true;
+        features.hasRegExpCall = true;
       }
     },
 
@@ -941,22 +1021,41 @@ function detectScopeAccessPattern(memberExpr) {
  */
 function mapFeaturesToOpcode(features) {
   const {
-    pushCount, popCount, readsFromStringTable, readsIndex,
-    readsDword, readsInstr,
+    pushCount, popCount, helperPushCount, helperPopCount,
+    readsFromStringTable, readsIndex, readsDword, readsInstr,
     hasForLoop, operators, callsApply, callsNew, accessesGlobal,
     usesReflectGet, accessesThis, accessesArguments, accessesScopes,
     accessesScopesWithBracket, hasAssignment, hasNullaryAssign,
     pushesNull, pushesUndefined, pushesFloat64, hasEqualsOne,
     hasIncrement, hasDecrement, hasArrayLiteral, hasObjectLiteral,
     hasSpread, hasFunctionExpr, hasTryFinally, hasThrow, hasDebugger,
-    bodyStmtCount, hasArrayFrom,
+    hasRegExpCall, bodyStmtCount, hasArrayFrom,
+    hasDirectReadDwordInBracket, hasVariableReadDwordInBracket,
+    hasNewRegExp, hasTryStackPush, hasTryStackPop,
   } = features;
 
   if (hasDebugger) {
     return 'DEBUGGER';
   }
 
+  if (hasNewRegExp && pushCount >= 1) {
+    return 'BUILD_REGEXP';
+  }
+
+  if (hasTryStackPush && !hasTryStackPop && helperPopCount === 0) {
+    return 'TRY_PUSH';
+  }
+
+  if (hasTryStackPop && !hasTryStackPush && helperPopCount === 0 && helperPushCount === 0) {
+    return 'TRY_POP';
+  }
+
   if (readsFromStringTable && readsDword && pushCount >= 1 && popCount === 0) {
+    return 'STACK_PUSH_STRING';
+  }
+
+  if (hasDirectReadDwordInBracket && pushCount >= 1 && popCount === 0 && 
+      bodyStmtCount === 1 && !accessesScopesWithBracket) {
     return 'STACK_PUSH_STRING';
   }
 
@@ -983,8 +1082,12 @@ function mapFeaturesToOpcode(features) {
     return 'STACK_PUSH_UNDEFINED';
   }
 
-  if (popCount === 1 && pushCount === 0 && bodyStmtCount === 1) {
+  if (popCount === 1 && pushCount === 0 && bodyStmtCount === 1 && !hasTryStackPop) {
     return 'STACK_POP';
+  }
+
+  if (features.accessesStackLast && pushCount >= 1 && popCount === 0 && bodyStmtCount === 1) {
+    return 'STACK_PUSH_DUPLICATE';
   }
 
   if (accessesThis && pushCount >= 1 && popCount === 0 && bodyStmtCount <= 2) {
@@ -999,6 +1102,11 @@ function mapFeaturesToOpcode(features) {
   }
 
   if (accessesArguments && readsIndex && pushCount >= 1 && !hasForLoop && !accessesScopesWithBracket) {
+    return 'LOAD_ARGUMENT';
+  }
+
+  if (hasVariableReadDwordInBracket && pushCount >= 1 && popCount === 0 &&
+      bodyStmtCount === 2 && !accessesScopesWithBracket) {
     return 'LOAD_ARGUMENT';
   }
 
@@ -1060,12 +1168,22 @@ function mapFeaturesToOpcode(features) {
     return 'BUILD_OBJECT';
   }
 
-  if (operators.has('+') && !hasIncrement && popCount >= 1 && pushCount >= 1 &&
+  // Unary minus/plus must be checked before binary arithmetic
+  // Unary has popCount === 1, binary has popCount >= 2
+  if (features.hasUnaryMinus && popCount === 1 && pushCount >= 1 && bodyStmtCount === 1) {
+    return 'UNARY_MINUS';
+  }
+
+  if (features.hasUnaryPlus && popCount === 1 && pushCount >= 1 && bodyStmtCount === 1) {
+    return 'UNARY_PLUS';
+  }
+
+  if (operators.has('+') && !hasIncrement && popCount >= 2 && pushCount >= 1 &&
       bodyStmtCount <= 4 && !hasForLoop) {
     return 'ARITHMETIC_ADD';
   }
 
-  if (operators.has('-') && !hasDecrement && popCount >= 1 && pushCount >= 1 &&
+  if (operators.has('-') && !hasDecrement && popCount >= 2 && pushCount >= 1 &&
       bodyStmtCount <= 4 && !hasForLoop && !operators.has('+')) {
     return 'ARITHMETIC_SUB';
   }
@@ -1197,6 +1315,14 @@ function mapFeaturesToOpcode(features) {
     return 'COMPLEX_PROP_UPDATE_MINUS';
   }
 
+  if (callsNew && pushCount >= 1 && hasRegExpCall) {
+    return 'BUILD_REGEXP';
+  }
+
+  if (hasTryFinally && pushCount === 0 && readsIndex) {
+    return 'TRY_PUSH';
+  }
+
   return null;
 }
 
@@ -1273,7 +1399,13 @@ export function analyzeHandlerStructure(funcNode, helperFns, vmState) {
 
   if (!opcode) {
     if (features.hasDoubleNestedAccess && features.readsIndex && features.pushCount >= 1 && features.popCount === 0) {
-      opcode = 'STACK_PUSH_STRING';
+      if (features.hasDirectReadDwordInBracket && features.bodyStmtCount === 1) {
+        opcode = 'STACK_PUSH_STRING';
+      } else if (features.hasVariableReadDwordInBracket && features.bodyStmtCount === 2) {
+        opcode = 'LOAD_ARGUMENT';
+      } else {
+        opcode = 'STACK_PUSH_STRING';
+      }
     } else if (features.hasDoubleNestedAccess && features.pushCount >= 1 && features.readsIndex && !features.hasAssignment) {
       opcode = 'LOAD_VARIABLE';
     } else if (features.hasDoubleNestedAccess && features.hasAssignment && !features.pushCount) {

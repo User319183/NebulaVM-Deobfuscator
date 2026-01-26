@@ -144,6 +144,13 @@ export const OperationCode = {
   JUMP_IF_FALSE: 71,
   RETURN: 72,
   DEBUGGER: 73,
+  // V2 opcodes (Jan 21, 2026+)
+  BUILD_REGEXP: 74,
+  TRY_PUSH: 75,
+  TRY_POP: 76,
+  TRY_CATCH: 77,
+  TRY_FINALLY: 78,
+  SEQUENCE_POP: 79,
 };
 
 /**
